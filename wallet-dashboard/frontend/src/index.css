@@ -1,3 +1,57 @@
-@import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&display=swap');
-body { font-family: 'Space Grotesk', sans-serif; }
-.neon-green { text-shadow: 0 0 25px #10b981; }
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
+@import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700&display=swap');
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  font-family: 'Inter', sans-serif;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  background-color: #0B0F17;
+  color: #F9FAFB;
+}
+
+/* Ensure all inputs have proper text visibility */
+input,
+select,
+textarea {
+  color: #F9FAFB !important;
+}
+
+input::placeholder,
+select::placeholder,
+textarea::placeholder {
+  color: #6B7280 !important;
+}
+
+/* Custom scrollbar */
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+
+::-webkit-scrollbar-track {
+  background: #111827;
+}
+
+::-webkit-scrollbar-thumb {
+  background: #1F2937;
+  border-radius: 4px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: #374151;
+}
+
+/* Selection color */
+::selection {
+  background-color: rgba(0, 240, 255, 0.3);
+  color: #F9FAFB;
+}

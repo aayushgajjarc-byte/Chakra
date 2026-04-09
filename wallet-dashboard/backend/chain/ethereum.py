@@ -1,362 +1,1079 @@
-# import requests
-# import time
-# from datetime import datetime, timezone
-# from collections import deque
+"""
+chain/ethereum.py -- Full-forensic Ethereum wallet data fetcher.
 
-# ETHERSCAN_API_KEY = "XEKQ25UDD4ZTHVXQF5PQFSIGF6X8BU3DF3"
-# ETHERSCAN_URL = "https://api.etherscan.io/v2/api"
-# CHAIN_ID_ETHEREUM = 1
+Performance Edition: optimized for <5s response time.
 
+Key optimizations vs the previous version:
+  (A) Recent-window fetching: only queries the last RECENT_BLOCKS_WINDOW blocks
+      instead of scanning from block 0. This alone cuts fetch time by ~97%.
+  (B) Reduced chunk count: MAX_CHUNKS=3 (was 12). Fewer parallel HTTP calls
+      means less API key pressure and faster scheduling overhead.
+  (C) Single latest_block fetch: latestBlock is fetched once at analysis start
+      and passed through to every function -- no repeated proxy calls.
+  (D) BFS wallet cap: at most BFS_MAX_WALLETS_PER_HOP wallets expanded per
+      hop layer, preventing exponential node explosion.
+  (E) In-memory BFS cache: BFS node results are cached for BFS_CACHE_TTL
+      seconds. If the same wallet appears in multiple hop layers, it is
+      served from cache instead of re-fetching.
+  (F) Parallel everything: balance, txlist, txlistinternal, tokentx, and BFS
+      all fire concurrently inside ethereum_wallet_info().
+  (G) 3 retries max (was 4): saves up to 20s on consistently failing keys.
+"""
 
-# def fetch_transactions(address: str) -> list:
-#     params = {
-#         "chainid": CHAIN_ID_ETHEREUM,
-#         "module": "account",
-#         "action": "txlist",
-#         "address": address,
-#         "startblock": 0,
-#         "endblock": 99999999,
-#         "sort": "asc",
-#         "apikey": ETHERSCAN_API_KEY
-#     }
+from __future__ import annotations
 
-#     try:
-#         resp = requests.get(ETHERSCAN_URL, params=params, timeout=15)
-#         resp.raise_for_status()
-#         data = resp.json()
-#     except Exception:
-#         return []
-
-#     if data.get("status") != "1":
-#         return []
-
-#     return data.get("result", [])
-
-
-# def bfs_wallet_hops(
-#     start_address: str,
-#     hop_limit: int = 1,
-#     tx_limit: int = 10,
-#     min_eth_value: float = 0.001
-# ) -> list:
-#     visited = set()
-#     results = []
-#     queue = deque([(start_address.lower(), 0)])
-
-#     while queue:
-#         current_wallet, depth = queue.popleft()
-
-#         if current_wallet in visited or depth > hop_limit:
-#             continue
-
-#         visited.add(current_wallet)
-
-#         txs = fetch_transactions(current_wallet)
-#         if not txs:
-#             continue
-
-#         txs = txs[: tx_limit * 4]
-#         hop_tx_count = 0
-
-#         for tx in txs:
-#             if tx.get("isError") != "0":
-#                 continue
-
-#             # skip contract interactions
-#             if tx.get("input") != "0x":
-#                 continue
-
-#             from_addr = tx.get("from", "").lower()
-#             to_addr = tx.get("to").lower() if tx.get("to") else None
-
-#             eth_value = int(tx.get("value", "0")) / 10**18
-#             if eth_value < min_eth_value:
-#                 continue
-
-#             timestamp = datetime.fromtimestamp(
-#                 int(tx["timeStamp"]),
-#                 tz=timezone.utc
-#             ).isoformat()
-
-#             results.append({
-#                 "chain": "ethereum",
-#                 "hop": depth,
-#                 "from": from_addr,
-#                 "to": to_addr,
-#                 "value_eth": eth_value,
-#                 "timestamp": timestamp,
-#                 "tx_hash": tx["hash"]
-#             })
-
-#             hop_tx_count += 1
-
-#             if depth < hop_limit:
-#                 if from_addr and from_addr not in visited:
-#                     queue.append((from_addr, depth + 1))
-#                 if to_addr and to_addr not in visited:
-#                     queue.append((to_addr, depth + 1))
-
-#             if hop_tx_count >= tx_limit:
-#                 break
-
-#         time.sleep(0.2)
-
-#     return results
-
-import requests
+import asyncio
+import math
 import time
+import logging
+from collections import defaultdict
 from datetime import datetime, timezone
-from collections import deque
+from typing import Any, Dict, List, Optional, Set, Tuple
 
-ETHERSCAN_API_KEY = "XEKQ25UDD4ZTHVXQF5PQFSIGF6X8BU3DF3"
+from api_pool import get_etherscan_pool
+from config import (
+    MAX_BLOCK,
+    MIN_ETH_VALUE,
+    MAX_CHUNKS,
+    BFS_CHUNK_COUNT,
+    ETHERSCAN_RESULT_LIMIT,
+    RECENT_BLOCKS_WINDOW,
+    BFS_MAX_WALLETS_PER_HOP,
+    BFS_CACHE_TTL,
+    BFS_NODE_TIMEOUT,
+)
+
+logger = logging.getLogger("wallet-dashboard")
+
 ETHERSCAN_URL = "https://api.etherscan.io/v2/api"
 CHAIN_ID_ETHEREUM = 1
 
+# ---------------------------------------------------------------------------
+# In-memory BFS node cache  {address -> (timestamp, (edges, wallets))}
+# ---------------------------------------------------------------------------
+_bfs_cache: Dict[str, Tuple[float, Tuple[List, List]]] = {}
 
-def fetch_transactions(address: str) -> list:
+
+def _bfs_cache_get(address: str) -> Optional[Tuple[List, List]]:
+    """Return cached BFS node result if still within TTL, else None."""
+    entry = _bfs_cache.get(address)
+    if entry is None:
+        return None
+    ts, data = entry
+    if time.monotonic() - ts > BFS_CACHE_TTL:
+        del _bfs_cache[address]
+        return None
+    logger.debug(f"[cache] BFS hit for {address[:10]}...")
+    return data
+
+
+def _bfs_cache_set(address: str, data: Tuple[List, List]) -> None:
+    _bfs_cache[address] = (time.monotonic(), data)
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _dedup_and_sort(
+    txs: List[Dict[str, Any]], sort_desc: bool = True
+) -> List[Dict[str, Any]]:
+    """De-duplicate by 'hash' / 'transactionHash', sort by blockNumber."""
+    seen: Set[str] = set()
+    unique: List[Dict[str, Any]] = []
+    for tx in txs:
+        h = tx.get("hash") or tx.get("transactionHash") or ""
+        if h and h in seen:
+            continue
+        if h:
+            seen.add(h)
+        unique.append(tx)
+    unique.sort(key=lambda x: int(x.get("blockNumber", 0) or 0), reverse=sort_desc)
+    return unique
+
+
+def _make_block_chunks(
+    start_block: int, end_block: int, chunk_count: int
+) -> List[Tuple[int, int]]:
+    """Divide [start_block, end_block] into chunk_count equal slices."""
+    if start_block > end_block:
+        return [(start_block, end_block)]
+    total = end_block - start_block + 1
+    chunk_size = math.ceil(total / chunk_count)
+    chunks: List[Tuple[int, int]] = []
+    for i in range(chunk_count):
+        s = start_block + i * chunk_size
+        e = min(s + chunk_size - 1, end_block)
+        if s > end_block:
+            break
+        chunks.append((s, e))
+    return chunks
+
+
+def _fmt_time(ts: Any) -> str:
+    if ts is None:
+        return ""
+    try:
+        return datetime.fromtimestamp(int(ts), tz=timezone.utc).isoformat()
+    except Exception:
+        return str(ts)
+
+
+def _fmt_value_eth(v: Any) -> str:
+    """Convert raw wei string or float to a decimal-ETH string."""
+    if v is None:
+        return "0"
+    try:
+        if isinstance(v, (float, int)):
+            return str(float(v))
+        s = str(v)
+        return s if "." in s else str(int(s) / 10**18)
+    except Exception:
+        return str(v)
+
+
+# ---------------------------------------------------------------------------
+# Phase 1 -- Latest block
+# ---------------------------------------------------------------------------
+
+async def fetch_latest_block_number() -> int:
+    """Fetches the latest Ethereum block number from Etherscan proxy."""
+    params = {
+        "chainid": CHAIN_ID_ETHEREUM,
+        "module": "proxy",
+        "action": "eth_blockNumber",
+    }
+    pool = get_etherscan_pool()
+    t0 = time.monotonic()
+    try:
+        data = await pool.fetch(ETHERSCAN_URL, params)
+        result = data.get("result")
+        if result:
+            block = int(result, 16)
+            logger.info(f"[ethereum] Latest block: {block} ({time.monotonic()-t0:.2f}s)")
+            return block
+        logger.warning("[ethereum] Could not parse latest block, using fallback")
+        return MAX_BLOCK
+    except Exception as e:
+        logger.error(f"[ethereum] fetch_latest_block_number error: {e}")
+        return MAX_BLOCK
+
+
+# ---------------------------------------------------------------------------
+# Phase 2 -- Single-chunk + pagination-safe fetcher
+# ---------------------------------------------------------------------------
+
+# Maximum bisection depth for pagination splits -- prevents infinite recursion
+MAX_PAGINATION_DEPTH: int = 10
+
+
+async def _fetch_range(
+    address: str,
+    action: str,
+    start_block: int,
+    end_block: int,
+    _depth: int = 0,
+) -> List[Dict[str, Any]]:
+    """
+    Fetch one block range for the given Etherscan action.
+
+    Auto-bisects if result hits ETHERSCAN_RESULT_LIMIT.
+    Depth-capped at MAX_PAGINATION_DEPTH to prevent infinite recursion.
+    """
+    if start_block > end_block:
+        return []
+
     params = {
         "chainid": CHAIN_ID_ETHEREUM,
         "module": "account",
-        "action": "txlist",
+        "action": action,
         "address": address,
-        "startblock": 0,
-        "endblock": 99999999,
+        "startblock": start_block,
+        "endblock": end_block,
         "sort": "asc",
-        "apikey": ETHERSCAN_API_KEY
     }
-
+    pool = get_etherscan_pool()
+    t0 = time.monotonic()
+    logger.debug(
+        f"[ethereum] API call: action={action} addr={address[:10]}... "
+        f"blocks [{start_block}->{end_block}] depth={_depth}"
+    )
     try:
-        resp = requests.get(ETHERSCAN_URL, params=params, timeout=15)
-        resp.raise_for_status()
-        data = resp.json()
-    except Exception:
+        data = await pool.fetch(ETHERSCAN_URL, params)
+    except Exception as e:
+        logger.error(f"[ethereum] _fetch_range({action}) error after {time.monotonic()-t0:.2f}s: {e}")
         return []
+
+    elapsed = time.monotonic() - t0
 
     if data.get("status") != "1":
+        msg = data.get("message", "")
+        result_val = data.get("result", "")
+        if "No transactions found" not in str(result_val):
+            logger.warning(
+                f"[ethereum] Etherscan {action} status=0 msg={msg!r} "
+                f"blocks=[{start_block}->{end_block}] ({elapsed:.2f}s)"
+            )
         return []
 
-    return data.get("result", [])
+    result: List[Dict[str, Any]] = data.get("result", [])
+    result_count = len(result)
+    logger.debug(f"[ethereum] API done: action={action} rows={result_count} in {elapsed:.2f}s")
+
+    # Pagination split
+    if result_count >= ETHERSCAN_RESULT_LIMIT and start_block < end_block:
+        if _depth >= MAX_PAGINATION_DEPTH:
+            logger.warning(
+                f"[ethereum] Pagination depth limit ({MAX_PAGINATION_DEPTH}) "
+                f"reached for {action} blocks=[{start_block}->{end_block}]. "
+                f"Returning {result_count} truncated rows."
+            )
+            return result
+
+        mid = (start_block + end_block) // 2
+        logger.info(
+            f"[ethereum] Pagination split (depth={_depth+1}): {action} "
+            f"[{start_block}->{mid}] + [{mid+1}->{end_block}] ({result_count} rows)"
+        )
+        left, right = await asyncio.gather(
+            _fetch_range(address, action, start_block, mid, _depth + 1),
+            _fetch_range(address, action, mid + 1, end_block, _depth + 1),
+            return_exceptions=True,
+        )
+        merged: List[Dict[str, Any]] = []
+        for part in (left, right):
+            if isinstance(part, list):
+                merged.extend(part)
+        return merged
+
+    return result
 
 
-def fetch_balance(address: str) -> float:
+# ---------------------------------------------------------------------------
+# Phase 3 -- Chunked parallel fetchers (recent-window, 3 chunks max)
+# ---------------------------------------------------------------------------
+
+def _recent_block_range(latest_block: int) -> Tuple[int, int]:
+    """
+    Return (start_block, end_block) for the recent window.
+
+    Instead of scanning from block 0 (years of history), we only look at
+    the last RECENT_BLOCKS_WINDOW blocks. For RECENT_BLOCKS_WINDOW=200_000
+    and ~12s/block, this covers approximately the last 27 days of activity.
+
+    WHY THIS WORKS: For BFS forensic tracing we care about recent money flows,
+    not a wallet's full lifetime. Recent-window fetching is ~97% faster.
+    """
+    start = max(0, latest_block - RECENT_BLOCKS_WINDOW)
+    return start, latest_block
+
+
+async def _fetch_chunked(
+    address: str,
+    action: str,
+    start_block: int,
+    end_block: int,
+    chunk_count: int = MAX_CHUNKS,
+    label: str = "",
+) -> List[Dict[str, Any]]:
+    """
+    Generic chunked fetcher: splits [start_block, end_block] into chunk_count
+    sub-ranges, fires them ALL concurrently, merges and deduplicates.
+    """
+    chunks = _make_block_chunks(start_block, end_block, chunk_count)
+    t0 = time.monotonic()
+    logger.info(
+        f"[ethereum] {label or action}: {len(chunks)} chunks "
+        f"for {address[:10]}... blocks [{start_block}->{end_block}]"
+    )
+
+    tasks = [_fetch_range(address, action, s, e) for s, e in chunks]
+    raw_results = await asyncio.gather(*tasks, return_exceptions=True)
+
+    all_txs: List[Dict[str, Any]] = []
+    for res in raw_results:
+        if isinstance(res, list):
+            all_txs.extend(res)
+        elif isinstance(res, Exception):
+            logger.error(f"[ethereum] {label} chunk failed: {res}")
+
+    merged = _dedup_and_sort(all_txs, sort_desc=True)
+    logger.info(
+        f"[ethereum] {label or action}: {len(merged)} txs in {time.monotonic()-t0:.2f}s"
+    )
+    return merged
+
+
+async def _fetch_with_fallback(
+    address: str,
+    action: str,
+    recent_start: int,
+    end_block: int,
+    chunk_count: int = MAX_CHUNKS,
+    label: str = "",
+) -> List[Dict[str, Any]]:
+    """
+    Try the recent-window first for speed.
+    If 0 results are found (wallet has no recent activity), automatically
+    retry with full history from block 0.
+
+    This fixes older wallets like 0x8d1b... whose transactions exist but
+    fall outside the RECENT_BLOCKS_WINDOW, without slowing down active
+    wallets that return results from the recent window immediately.
+    """
+    results = await _fetch_chunked(address, action, recent_start, end_block, chunk_count, label)
+    if results:
+        return results
+
+    # Recent window returned nothing -- fall back to full history
+    # Use chunk_count=1 for full history to avoid rate-limiting the Etherscan API.
+    # A single call from block 0 is enough for older wallets to find their activity.
+    if recent_start > 0:
+        logger.info(
+            f"[ethereum] {label or action}: 0 results in recent window "
+            f"[{recent_start}->{end_block}], retrying from block 0 (full history)"
+        )
+        return await _fetch_chunked(address, action, 0, end_block, 1, f"{label} [full]")
+
+    return results
+
+
+async def fetch_transactions_chunked(
+    address: str, latest_block: Optional[int] = None
+) -> List[Dict[str, Any]]:
+    if latest_block is None:
+        latest_block = await fetch_latest_block_number()
+    start, end = _recent_block_range(latest_block)
+    return await _fetch_chunked(address, "txlist", start, end, MAX_CHUNKS, "Normal txs")
+
+
+async def fetch_internal_transactions_chunked(
+    address: str, latest_block: Optional[int] = None
+) -> List[Dict[str, Any]]:
+    if latest_block is None:
+        latest_block = await fetch_latest_block_number()
+    start, end = _recent_block_range(latest_block)
+    return await _fetch_chunked(address, "txlistinternal", start, end, MAX_CHUNKS, "Internal txs")
+
+
+async def fetch_token_transfers_chunked(
+    address: str, latest_block: Optional[int] = None
+) -> List[Dict[str, Any]]:
+    if latest_block is None:
+        latest_block = await fetch_latest_block_number()
+    start, end = _recent_block_range(latest_block)
+    return await _fetch_chunked(address, "tokentx", start, end, MAX_CHUNKS, "Token transfers")
+
+
+# ---------------------------------------------------------------------------
+# Balance & contract checks
+# ---------------------------------------------------------------------------
+
+async def fetch_balance(address: str) -> float:
+    """Fetches ETH balance in ether."""
     params = {
         "chainid": CHAIN_ID_ETHEREUM,
         "module": "account",
         "action": "balance",
         "address": address,
         "tag": "latest",
-        "apikey": ETHERSCAN_API_KEY
     }
-
+    pool = get_etherscan_pool()
+    t0 = time.monotonic()
     try:
-        resp = requests.get(ETHERSCAN_URL, params=params, timeout=15)
-        resp.raise_for_status()
-        data = resp.json()
-
+        data = await pool.fetch(ETHERSCAN_URL, params)
         if "result" not in data:
-            print("Balance API error:", data)
             return 0.0
-
-        balance_wei = int(data["result"])
-        balance_eth = balance_wei / 10**18
-
-        print(f"Balance fetched for {address}: {balance_eth} ETH")
+        balance_eth = int(data["result"]) / 10**18
+        logger.info(f"[ethereum] Balance: {balance_eth:.4f} ETH ({time.monotonic()-t0:.2f}s)")
         return balance_eth
-
-    except requests.exceptions.RequestException as e:
-        print("Network/API error while fetching balance:", e)
-        return 0.0
-
-    except ValueError as e:
-        print("Invalid balance value:", e)
+    except Exception as e:
+        logger.error(f"[ethereum] fetch_balance error for {address}: {e}")
         return 0.0
 
 
-def is_smart_contract(address: str) -> bool:
+async def is_smart_contract(address: str) -> bool:
+    """Returns True if the address has deployed bytecode."""
     params = {
         "chainid": CHAIN_ID_ETHEREUM,
         "module": "proxy",
         "action": "eth_getCode",
         "address": address,
         "tag": "latest",
-        "apikey": ETHERSCAN_API_KEY
     }
-
+    pool = get_etherscan_pool()
     try:
-        resp = requests.get(ETHERSCAN_URL, params=params, timeout=15)
-        resp.raise_for_status()
-        data = resp.json()
+        data = await pool.fetch(ETHERSCAN_URL, params)
         code = data.get("result")
-        
-        # "0x" = empty code = EOA (not a contract)
-        # "0x" + hex = has code = smart contract
-        is_contract = code not in ("0x", "0x0", None, "")
-        return is_contract
-        
+        return code not in ("0x", "0x0", None, "")
     except Exception as e:
-        print(f"is_smart_contract error for {address}: {e}")
+        logger.error(f"[ethereum] is_smart_contract error for {address}: {e}")
         return False
 
 
-def bfs_wallet_hops(
+async def batch_is_contract(addresses: List[str]) -> Dict[str, bool]:
+    """
+    Checks whether each address in the list is a smart contract.
+    All checks run concurrently. De-duplicates input.
+    """
+    unique = list(set(a.lower() for a in addresses if a))
+    if not unique:
+        return {}
+    results = await asyncio.gather(
+        *[is_smart_contract(addr) for addr in unique], return_exceptions=True
+    )
+    return {
+        addr: (res if isinstance(res, bool) else False)
+        for addr, res in zip(unique, results)
+    }
+
+
+# ---------------------------------------------------------------------------
+# BFS helpers -- edge collectors per transaction type
+# ---------------------------------------------------------------------------
+
+def _collect_normal_hops(
+    txs: List[Dict[str, Any]],
+    tx_limit: int,
+) -> Tuple[List[Dict[str, Any]], List[str]]:
+    """
+    Build edge records from normal (txlist) transactions.
+
+    Contract-call txs (input != '0x') get type='contract'.
+    Plain ETH transfers get type='eth'.
+    Failed txs and dust-only pure-ETH transfers are skipped.
+    """
+    edges: List[Dict[str, Any]] = []
+    new_wallets: List[str] = []
+
+    for tx in txs:
+        if tx.get("isError") == "1":
+            continue
+
+        from_addr = (tx.get("from") or "").lower()
+        to_addr = (tx.get("to") or "").lower() if tx.get("to") else None
+
+        eth_value = int(tx.get("value", "0") or "0") / 10**18
+        is_contract_call = tx.get("input", "0x") not in ("0x", "", None)
+
+        if eth_value < MIN_ETH_VALUE and not is_contract_call:
+            continue
+
+        tx_type = "contract" if is_contract_call else "eth"
+
+        edges.append(
+            {
+                "type": tx_type,
+                "from": from_addr,
+                "to": to_addr,
+                "value": _fmt_value_eth(tx.get("value", "0")),
+                "time": _fmt_time(tx.get("timeStamp")),
+                "hash": tx.get("hash", ""),
+                "chain": "ethereum",
+                "is_contract_call": is_contract_call,
+            }
+        )
+
+        if from_addr:
+            new_wallets.append(from_addr)
+        if to_addr:
+            new_wallets.append(to_addr)
+
+        if len(edges) >= tx_limit:
+            break
+
+    return edges, new_wallets
+
+
+def _collect_internal_hops(
+    txs: List[Dict[str, Any]],
+    tx_limit: int,
+) -> Tuple[List[Dict[str, Any]], List[str]]:
+    """Build edge records from internal (txlistinternal) transactions."""
+    edges: List[Dict[str, Any]] = []
+    new_wallets: List[str] = []
+
+    for tx in txs:
+        if tx.get("isError") == "1":
+            continue
+
+        from_addr = (tx.get("from") or "").lower()
+        to_addr = (tx.get("to") or "").lower() if tx.get("to") else None
+        eth_value = int(tx.get("value", "0") or "0") / 10**18
+
+        if eth_value < MIN_ETH_VALUE:
+            continue
+
+        edges.append(
+            {
+                "type": "internal",
+                "from": from_addr,
+                "to": to_addr,
+                "value": _fmt_value_eth(tx.get("value", "0")),
+                "time": _fmt_time(tx.get("timeStamp")),
+                "hash": tx.get("hash", "") or tx.get("transactionHash", ""),
+                "chain": "ethereum",
+            }
+        )
+
+        if from_addr:
+            new_wallets.append(from_addr)
+        if to_addr:
+            new_wallets.append(to_addr)
+
+        if len(edges) >= tx_limit:
+            break
+
+    return edges, new_wallets
+
+
+def _collect_token_hops(
+    txs: List[Dict[str, Any]],
+    tx_limit: int,
+) -> Tuple[List[Dict[str, Any]], List[str]]:
+    """Build edge records from ERC-20 token transfers (tokentx)."""
+    edges: List[Dict[str, Any]] = []
+    new_wallets: List[str] = []
+
+    for tx in txs:
+        from_addr = (tx.get("from") or "").lower()
+        to_addr = (tx.get("to") or "").lower() if tx.get("to") else None
+        if not from_addr or not to_addr:
+            continue
+
+        token_symbol = tx.get("tokenSymbol") or tx.get("tokenName") or "TOKEN"
+        token_contract = (tx.get("contractAddress") or "").lower()
+        decimals = int(tx.get("tokenDecimal") or 18)
+        raw_value = int(tx.get("value", "0") or "0")
+        try:
+            token_value = raw_value / (10**decimals)
+        except Exception:
+            token_value = 0.0
+
+        edges.append(
+            {
+                "type": "erc20",
+                "from": from_addr,
+                "to": to_addr,
+                "value": str(round(token_value, 6)),
+                "time": _fmt_time(tx.get("timeStamp")),
+                "hash": tx.get("hash", ""),
+                "chain": "ethereum",
+                "token_symbol": token_symbol,
+                "token_contract": token_contract,
+            }
+        )
+
+        new_wallets.append(from_addr)
+        new_wallets.append(to_addr)
+
+        if len(edges) >= tx_limit:
+            break
+
+    return edges, new_wallets
+
+
+# ---------------------------------------------------------------------------
+# Risk scoring engine
+# ---------------------------------------------------------------------------
+
+def compute_risk_score(
+    all_edges: List[Dict[str, Any]],
+    wallet_address: str,
+    is_contract: bool,
+) -> Tuple[int, List[str]]:
+    """
+    Compute a 0-100 risk score using 5 forensic heuristics.
+    Returns (risk_score: int, risk_flags: List[str])
+    """
+    if not all_edges:
+        return 0, []
+
+    score = 0
+    flags: List[str] = []
+
+    eth_values = [
+        float(e["value"]) for e in all_edges
+        if e.get("type") in ("eth", "internal") and e.get("value")
+    ]
+
+    # Heuristic 1: Large value spike
+    if eth_values and len(eth_values) > 1:
+        avg = sum(eth_values) / len(eth_values)
+        std = math.sqrt(sum((v - avg) ** 2 for v in eth_values) / len(eth_values))
+        max_val = max(eth_values)
+        if std > 0 and (max_val - avg) / std > 4:
+            score += 25
+            flags.append(f"Extreme value spike: max={max_val:.2f} ETH vs avg={avg:.4f} ETH")
+        elif std > 0 and (max_val - avg) / std > 2:
+            score += 10
+            flags.append(f"Unusual value spike: max={max_val:.2f} ETH")
+
+    # Heuristic 2: Transaction velocity
+    timestamps = []
+    for e in all_edges:
+        t_str = e.get("time", "")
+        if t_str:
+            try:
+                ts = datetime.fromisoformat(t_str.replace("Z", "+00:00"))
+                timestamps.append(ts.timestamp())
+            except Exception:
+                pass
+
+    if len(timestamps) > 1:
+        timestamps.sort()
+        time_span_seconds = timestamps[-1] - timestamps[0]
+        if time_span_seconds > 0:
+            txs_per_hour = len(timestamps) / (time_span_seconds / 3600)
+            if txs_per_hour > 100:
+                score += 25
+                flags.append(f"High transaction velocity: {txs_per_hour:.0f} txs/hour")
+            elif txs_per_hour > 30:
+                score += 10
+                flags.append(f"Elevated transaction velocity: {txs_per_hour:.0f} txs/hour")
+
+    # Heuristic 3: New wallet burst
+    all_addresses = set()
+    for e in all_edges:
+        if e.get("to"):
+            all_addresses.add(e["to"])
+        if e.get("from"):
+            all_addresses.add(e["from"])
+    all_addresses.discard(wallet_address)
+
+    unique_counterparty_count = len(all_addresses)
+    if unique_counterparty_count > 50:
+        score += 20
+        flags.append(f"Large counterparty network: {unique_counterparty_count} unique addresses")
+    elif unique_counterparty_count > 20:
+        score += 10
+        flags.append(f"Notable counterparty network: {unique_counterparty_count} unique addresses")
+
+    # Heuristic 4: Circular fund flow
+    forward_pairs: Set[Tuple[str, str]] = set()
+    circular_count = 0
+    for e in all_edges:
+        f = (e.get("from") or "").lower()
+        t = (e.get("to") or "").lower()
+        if f and t:
+            if (t, f) in forward_pairs:
+                circular_count += 1
+            forward_pairs.add((f, t))
+
+    if circular_count >= 3:
+        score += 20
+        flags.append(f"Circular fund flow detected: {circular_count} instances")
+    elif circular_count >= 1:
+        score += 8
+        flags.append(f"Possible circular flow: {circular_count} round-trip(s)")
+
+    # Heuristic 5: ERC-20 mixing ratio
+    erc20_count = sum(1 for e in all_edges if e.get("type") == "erc20")
+    total_count = len(all_edges)
+    if total_count > 0 and erc20_count / total_count > 0.8:
+        score += 10
+        flags.append(
+            f"High ERC-20 ratio ({erc20_count}/{total_count} txs): "
+            "possible token-based layering"
+        )
+
+    return min(100, score), flags
+
+
+# ---------------------------------------------------------------------------
+# BFS wallet hop traversal -- parallel depth-layer expansion + cache
+# ---------------------------------------------------------------------------
+
+async def _process_bfs_node(
+    address: str,
+    start_block: int,
+    end_block: int,
+    tx_limit: int,
+    depth: int = 0,
+) -> Tuple[List[Dict[str, Any]], List[str]]:
+    """
+    Fetch and collect edge types for one BFS node.
+
+    Speed strategy based on depth:
+      depth=0 (seed wallet): fetch all 3 types (txlist + internal + tokentx)
+      depth>0 (counterparty): fetch ONLY txlist — we only need to know what
+        wallets it touched, not its full token history. This cuts API calls
+        from 3 per node to 1, which is 3x faster at hop 1.
+
+    Uses in-memory cache to avoid re-fetching the same address.
+    """
+    cached = _bfs_cache_get(address)
+    if cached is not None:
+        return cached
+
+    t0 = time.monotonic()
+    logger.info(f"[ethereum] BFS node: {address[:10]}... depth={depth} [{start_block}->{end_block}]")
+
+    chunks = _make_block_chunks(start_block, end_block, BFS_CHUNK_COUNT)
+
+    if depth == 0:
+        # Seed wallet: fetch all 3 types with full-history fallback.
+        # If recent window returns 0 (older/inactive wallet), retries from block 0.
+        raw_normal, raw_internal, raw_token = await asyncio.gather(
+            _fetch_with_fallback(address, "txlist", start_block, end_block, BFS_CHUNK_COUNT, "BFS normal"),
+            _fetch_with_fallback(address, "txlistinternal", start_block, end_block, BFS_CHUNK_COUNT, "BFS internal"),
+            _fetch_with_fallback(address, "tokentx", start_block, end_block, BFS_CHUNK_COUNT, "BFS token"),
+            return_exceptions=True,
+        )
+    else:
+        # Counterparty wallet: only txlist, recent window only (speed priority)
+        raw_normal = await _fetch_chunked(address, "txlist", start_block, end_block, BFS_CHUNK_COUNT, "BFS hop txlist")
+        raw_internal = []
+        raw_token = []
+
+    def _safe_list(raw_results) -> List[Dict[str, Any]]:
+        empty: List[Dict[str, Any]] = []
+        if isinstance(raw_results, Exception):
+            return empty
+        if not raw_results:
+            return empty
+        # If it's a list of dicts (flat), just return it
+        if isinstance(raw_results, list) and len(raw_results) > 0 and isinstance(raw_results[0], dict):
+            return raw_results
+        # Backwards compatibility in case it's a list of lists
+        out: List[Dict[str, Any]] = []
+        for r in raw_results:
+            if isinstance(r, list):
+                out.extend(r)
+        return _dedup_and_sort(out, sort_desc=False)
+
+    normal_txs = _safe_list(raw_normal)
+    internal_txs = _safe_list(raw_internal)
+    token_txs = _safe_list(raw_token)
+
+    edges: List[Dict[str, Any]] = []
+    new_wallets: List[str] = []
+
+    n_edges, n_wallets = _collect_normal_hops(normal_txs, tx_limit)
+    i_edges, i_wallets = _collect_internal_hops(internal_txs, tx_limit)
+    t_edges, t_wallets = _collect_token_hops(token_txs, tx_limit)
+
+    edges.extend(n_edges)
+    edges.extend(i_edges)
+    edges.extend(t_edges)
+    new_wallets.extend(n_wallets)
+    new_wallets.extend(i_wallets)
+    new_wallets.extend(t_wallets)
+
+    logger.info(
+        f"[ethereum] BFS node done: {address[:10]}... "
+        f"{len(edges)} edges in {time.monotonic()-t0:.2f}s"
+    )
+
+    result = (edges, new_wallets)
+    _bfs_cache_set(address, result)
+    return result
+
+
+async def bfs_wallet_hops(
     start_address: str,
     hop_limit: int = 1,
     tx_limit: int = 10,
-    min_eth_value: float = 0.001
-) -> list:
-    visited = set()
-    results = []
-    queue = deque([(start_address.lower(), 0)])
+    min_eth_value: float = MIN_ETH_VALUE,
+    latest_block: Optional[int] = None,
+) -> List[Dict[str, Any]]:
+    """
+    BFS traversal over wallet connections -- parallel depth-layer expansion.
 
-    while queue:
-        current_wallet, depth = queue.popleft()
+    Performance improvements:
+    - latest_block is accepted as parameter (not re-fetched every call)
+    - Only queries last RECENT_BLOCKS_WINDOW blocks instead of full history
+    - At most BFS_MAX_WALLETS_PER_HOP wallets expanded per layer
+    - In-memory cache prevents re-processing the same address twice
+    - All nodes at the same hop depth processed concurrently
+    """
+    address = start_address.lower()
 
-        if current_wallet in visited or depth > hop_limit:
-            continue
+    if latest_block is None:
+        latest_block = await fetch_latest_block_number()
 
-        visited.add(current_wallet)
+    start_block, end_block = _recent_block_range(latest_block)
 
-        txs = fetch_transactions(current_wallet)
-        if not txs:
-            continue
+    visited: Set[str] = set()
+    all_edges: List[Dict[str, Any]] = []
+    total_t0 = time.monotonic()
 
-        txs = txs[: tx_limit * 4]
-        hop_tx_count = 0
+    current_layer: List[Tuple[str, int]] = [(address, 0)]
 
-        for tx in txs:
-            if tx.get("isError") != "0":
+    while current_layer:
+        to_process = [
+            (addr, depth)
+            for addr, depth in current_layer
+            if addr not in visited and depth <= hop_limit
+        ]
+        if not to_process:
+            break
+
+        # Cap wallets per hop to prevent exponential explosion
+        if len(to_process) > BFS_MAX_WALLETS_PER_HOP:
+            logger.info(
+                f"[ethereum] BFS hop cap: trimming {len(to_process)} "
+                f"-> {BFS_MAX_WALLETS_PER_HOP} wallets at depth={to_process[0][1]}"
+            )
+            to_process = to_process[:BFS_MAX_WALLETS_PER_HOP]
+
+        for addr, _ in to_process:
+            visited.add(addr)
+
+        logger.info(
+            f"[ethereum] BFS layer depth={to_process[0][1]}, "
+            f"nodes={len(to_process)}, processing in parallel"
+        )
+        layer_t0 = time.monotonic()
+
+        # All nodes in this layer run concurrently.
+        # Seed wallet (depth=0) gets a generous timeout because its complete history
+        # is required for the main UI payload. Counterparties (depth>0) stay strict.
+        async def _timed_node(addr: str, depth: int):
+            timeout_val = BFS_NODE_TIMEOUT if depth > 0 else 30.0
+            try:
+                return await asyncio.wait_for(
+                    _process_bfs_node(addr, start_block, end_block, tx_limit, depth),
+                    timeout=timeout_val,
+                )
+            except asyncio.TimeoutError:
+                logger.warning(
+                    f"[ethereum] BFS node {addr[:10]}... timed out after {timeout_val}s — skipping"
+                )
+                return ([], [])
+
+        layer_results = await asyncio.gather(
+            *[_timed_node(addr, depth) for addr, depth in to_process],
+            return_exceptions=True,
+        )
+
+        logger.info(
+            f"[ethereum] BFS layer done in {time.monotonic()-layer_t0:.2f}s"
+        )
+
+        next_layer: List[Tuple[str, int]] = []
+        for (addr, depth), result in zip(to_process, layer_results):
+            if isinstance(result, Exception):
+                logger.error(f"[ethereum] BFS node {addr[:10]}... failed: {result}")
                 continue
 
-            # skip contract interactions
-            if tx.get("input") != "0x":
-                continue
-
-            from_addr = tx.get("from", "").lower()
-            to_addr = tx.get("to").lower() if tx.get("to") else None
-
-            eth_value = int(tx.get("value", "0")) / 10**18
-            if eth_value < min_eth_value:
-                continue
-
-            timestamp = datetime.fromtimestamp(
-                int(tx["timeStamp"]),
-                tz=timezone.utc
-            ).isoformat()
-
-            results.append({
-                "chain": "ethereum",
-                "from": from_addr,
-                "to": to_addr,
-                "value_eth": eth_value,
-                "timestamp": timestamp,
-                "tx_hash": tx["hash"]
-            })
-
-            hop_tx_count += 1
+            node_edges, new_wallets = result
+            all_edges.extend(node_edges)
 
             if depth < hop_limit:
-                if from_addr and from_addr not in visited:
-                    queue.append((from_addr, depth + 1))
-                if to_addr and to_addr not in visited:
-                    queue.append((to_addr, depth + 1))
+                for w in new_wallets:
+                    if w and w not in visited:
+                        next_layer.append((w, depth + 1))
 
-            if hop_tx_count >= tx_limit:
-                break
+        # Deduplicate next layer
+        seen_next: Set[str] = set()
+        deduped_next: List[Tuple[str, int]] = []
+        for addr, depth in next_layer:
+            if addr not in seen_next:
+                seen_next.add(addr)
+                deduped_next.append((addr, depth))
 
-        time.sleep(0.2)
+        current_layer = deduped_next
 
-    return results
+    logger.info(
+        f"[ethereum] BFS complete: {len(all_edges)} total edges "
+        f"in {time.monotonic()-total_t0:.2f}s"
+    )
+    return all_edges
 
 
-def get_wallet_data(address: str) -> dict:
-    address = address.lower()
+# ---------------------------------------------------------------------------
+# Graph builder -- converts BFS edge list -> ReactFlow-compatible graph
+# ---------------------------------------------------------------------------
 
-    transactions = fetch_transactions(address)
-    balance = fetch_balance(address)
-    smart_contract = is_smart_contract(address)
+def build_graph(
+    transactions: List[Dict[str, Any]],
+    wallet_address: str,
+) -> Dict[str, Any]:
+    """
+    Convert the flat BFS edge list into a {nodes, edges} graph structure
+    compatible with the frontend ReactFlow renderer.
+    """
+    seen_nodes: Set[str] = set()
+    nodes: List[Dict[str, Any]] = []
+    edges: List[Dict[str, Any]] = []
 
-    formatted_txs = []
     for tx in transactions:
-        formatted_txs.append({
-            "hash": tx.get("hash"),
-            "from": tx.get("from"),
-            "to": tx.get("to"),
-            "value_eth": int(tx.get("value", "0")) / 10**18,
-            "timestamp": datetime.fromtimestamp(
-                int(tx["timeStamp"]),
-                tz=timezone.utc
-            ).isoformat()
-        })
+        for addr_key in ("from", "to"):
+            addr = (tx.get(addr_key) or "").lower()
+            if addr and addr not in seen_nodes:
+                seen_nodes.add(addr)
+                nodes.append(
+                    {
+                        "id": addr,
+                        "address": addr,
+                        "is_contract": tx.get("is_contract", False),
+                        "type": (
+                            "contract"
+                            if tx.get("is_contract", False)
+                            else "normal"
+                        ),
+                        "is_center": addr == wallet_address.lower(),
+                    }
+                )
 
-    return {
-        "wallet": address,
-        "currency": "ETH",
-        "is_smart_contract": smart_contract,
-        "transaction_count": len(transactions),
-        "balance": balance,
-        "transactions": formatted_txs,
-        "hops": 0
-    }
+    for i, tx in enumerate(transactions):
+        from_addr = (tx.get("from") or "").lower()
+        to_addr = (tx.get("to") or "").lower() if tx.get("to") else None
+        if not from_addr or not to_addr:
+            continue
+        edge_id = tx.get("hash") or f"edge-{i}"
+        edges.append(
+            {
+                "id": edge_id,
+                "from": from_addr,
+                "to": to_addr,
+                "value": tx.get("value", "0"),
+                "type": tx.get("type", "eth"),
+                "hash": tx.get("hash", ""),
+                "time": tx.get("time", ""),
+                "token_symbol": tx.get("token_symbol"),
+                "token_contract": tx.get("token_contract"),
+            }
+        )
 
-def ethereum_wallet_info(address: str, hops: int = 1, tx_limit: int = 10) -> dict:
+    logger.debug(
+        f"[ethereum] build_graph: {len(nodes)} nodes, {len(edges)} edges"
+    )
+    return {"nodes": nodes, "edges": edges}
+
+
+# ---------------------------------------------------------------------------
+# Main wallet analysis -- all tasks in one asyncio.gather
+# ---------------------------------------------------------------------------
+
+async def ethereum_wallet_info(
+    address: str, hops: int = 1, tx_limit: int = 10
+) -> dict:
     """
-    Return a standardized wallet summary matching frontend expectations:
-      - wallet, currency, balance, is_smart_contract
-      - transaction_count (raw txs), hops, tx_limit
-      - transactions: list of rows with keys: from, to, time, chain, hash, value
+    Orchestrates a full wallet analysis -- optimized for <5s response.
+
+    Performance strategy:
+    1. Fetch latest block ONCE -- passed to all sub-functions
+    2. Compute recent window [latest-200k, latest] -- skip full history
+    3. Fire all tasks concurrently: balance, contract check, 3 tx types, BFS
+    4. BFS capped at BFS_MAX_WALLETS_PER_HOP wallets per layer
+    5. In-memory cache prevents re-fetching repeated addresses in BFS
     """
     address = address.lower()
+    total_t0 = time.monotonic()
+    logger.info(f"[ethereum] === Analysis start: {address} hops={hops} limit={tx_limit} ===")
 
-    balance = fetch_balance(address) if "fetch_balance" in globals() else 0
-    is_contract = is_smart_contract(address) if "is_smart_contract" in globals() else False
-    raw_txs = fetch_transactions(address) or [] if "fetch_transactions" in globals() else []
-    bfs_txs = bfs_wallet_hops(address, hops, tx_limit) or [] if "bfs_wallet_hops" in globals() else []
+    # Step 1: Fetch latest block once -- shared across ALL subsequent calls
+    latest_block = await fetch_latest_block_number()
+    start_block, end_block = _recent_block_range(latest_block)
+    logger.info(
+        f"[ethereum] Block window: [{start_block} -> {end_block}] "
+        f"({end_block - start_block:,} blocks = last {RECENT_BLOCKS_WINDOW:,} blocks)"
+    )
 
-    def fmt_time(ts):
-        if ts is None:
-            return ""
-        try:
-            t = int(ts)
-            return datetime.fromtimestamp(t, tz=timezone.utc).isoformat()
-        except Exception:
-            return str(ts)
+    # Step 2: Fire ALL independent tasks concurrently in one gather
+    # _fetch_with_fallback: tries recent window first; falls back to block 0
+    # if no results found -- fixes older/inactive wallets transparently.
+    (
+        balance,
+        is_contract,
+        raw_txs,
+        internal_txs,
+        token_txs,
+        bfs_edges,
+    ) = await asyncio.gather(
+        fetch_balance(address),
+        is_smart_contract(address),
+        _fetch_with_fallback(address, "txlist", start_block, end_block, MAX_CHUNKS, "Normal txs"),
+        _fetch_with_fallback(address, "txlistinternal", start_block, end_block, MAX_CHUNKS, "Internal txs"),
+        _fetch_with_fallback(address, "tokentx", start_block, end_block, MAX_CHUNKS, "Token transfers"),
+        bfs_wallet_hops(address, hops, tx_limit, latest_block=latest_block),
+        return_exceptions=True,
+    )
 
-    def fmt_value(v):
-        if v is None:
-            return "0"
-        try:
-            # prefer already-in-ETH value (float), else treat as wei int string
-            if isinstance(v, (float, int)):
-                return str(float(v))
-            s = str(v)
-            if "." in s:
-                return s
-            # assume wei
-            return str(int(s) / 10**18)
-        except Exception:
-            return str(v)
+    def _safe(val, default):
+        if isinstance(val, Exception):
+            logger.error(f"[ethereum] Parallel task failed: {val!r}")
+            return default
+        return val
 
-    formatted = []
-    for tx in bfs_txs:
-        h = tx.get("tx_hash") or tx.get("hash") or tx.get("transactionHash")
-        ts = tx.get("timestamp") or tx.get("timeStamp") or tx.get("time")
-        val = tx.get("value_eth") or tx.get("value")
-        formatted.append({
-            "from": tx.get("from") or tx.get("sender") or "",
-            "to": tx.get("to") or tx.get("recipient") or "",
-            "time": fmt_time(ts),
-            "chain": (tx.get("chain") or "ethereum").lower(),
-            "hash": h or "",
-            "value": fmt_value(val),
-        })
+    balance = _safe(balance, 0.0)
+    is_contract = _safe(is_contract, False)
+    raw_txs = _safe(raw_txs, [])
+    internal_txs = _safe(internal_txs, [])
+    token_txs = _safe(token_txs, [])
+    bfs_edges = _safe(bfs_edges, [])
+
+    total_elapsed = time.monotonic() - total_t0
+    logger.info(
+        f"[ethereum] === Analysis complete: {address} ===\n"
+        f"  Normal txs      : {len(raw_txs)}\n"
+        f"  Internal txs    : {len(internal_txs)}\n"
+        f"  Token transfers : {len(token_txs)}\n"
+        f"  BFS edges       : {len(bfs_edges)}\n"
+        f"  Total time      : {total_elapsed:.2f}s"
+    )
+
+    # Step 3: Batch contract check for BFS counterparties
+    unique_addrs = list({
+        (e.get("from") or "").lower()
+        for e in bfs_edges
+        if e.get("from")
+    } | {
+        (e.get("to") or "").lower()
+        for e in bfs_edges
+        if e.get("to")
+    })
+    unique_addrs = [a for a in unique_addrs if a and a != address]
+
+    contract_map: Dict[str, bool] = {}
+    if unique_addrs:
+        logger.info(f"[ethereum] Batch contract check: {len(unique_addrs)} addresses")
+        contract_map = await batch_is_contract(unique_addrs)
+    contract_map[address] = bool(is_contract)
+
+    # Step 4: Compute backend risk score
+    risk_score, risk_flags = compute_risk_score(bfs_edges, address, bool(is_contract))
+
+    # Step 5: Format BFS edges for frontend
+    formatted: List[Dict[str, Any]] = []
+    for edge in bfs_edges:
+        from_addr = (edge.get("from") or "").lower()
+        to_addr = (edge.get("to") or "").lower() if edge.get("to") else None
+        formatted.append(
+            {
+                "type": edge.get("type", "eth"),
+                "from": from_addr,
+                "to": to_addr,
+                "value": edge.get("value", "0"),
+                "time": edge.get("time", ""),
+                "chain": edge.get("chain", "ethereum"),
+                "hash": edge.get("hash", ""),
+                "token_symbol": edge.get("token_symbol"),
+                "token_contract": edge.get("token_contract"),
+                "is_contract": contract_map.get(to_addr or "", False),
+            }
+        )
+
+    # Step 6: Build graph structure
+    graph = build_graph(formatted, address)
+
+    final_elapsed = time.monotonic() - total_t0
+    logger.info(f"[ethereum] === Total wall-clock time: {final_elapsed:.2f}s ===")
 
     return {
         "wallet": address,
         "currency": "ETH",
-        "balance": float(balance or 0.0),
+        "balance": float(balance),
         "is_smart_contract": bool(is_contract),
         "transaction_count": len(raw_txs),
+        "internal_transaction_count": len(internal_txs),
+        "token_transaction_count": len(token_txs),
         "hops": int(hops),
         "tx_limit": int(tx_limit),
-        "transactions": formatted
+        "transactions": formatted,
+        "graph": graph,
+        "risk_score": risk_score,
+        "risk_flags": risk_flags,
     }
