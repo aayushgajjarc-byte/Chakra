@@ -2,8 +2,8 @@ import { useState } from 'react'
 import { api, ApiError } from '../services/api'
 
 export default function Login({ onLoginSuccess }) {
-  const [username, setUsername] = useState('')
-  const [password, setPassword] = useState('')
+  const [username, setUsername] = useState('demo')
+  const [password, setPassword] = useState('demo')
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState(null)
 
@@ -40,7 +40,7 @@ export default function Login({ onLoginSuccess }) {
           <img src="/chakra-logo.png" alt="CHAKRA" className="h-12 w-auto object-contain mx-auto" />
           <h1 className="text-2xl font-mono font-bold text-textPrimary">Sign in to Dashboard</h1>
           <p className="text-sm text-textSecondary">
-            Demo access only. Use your provided credentials.
+            Demo access: Use username <b>demo</b> and password <b>demo</b>
           </p>
         </div>
 

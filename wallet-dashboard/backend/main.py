@@ -20,6 +20,7 @@ from fastapi import (
     Query,
     Request,
     status,
+    BackgroundTasks,
 )
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
@@ -55,6 +56,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 # ---------------------------------------------------------------------------
 
 _redis_client = None
+_memory_cache = {} # Simple in-memory fallback for background precaching
 
 
 async def _get_redis():
@@ -80,7 +82,12 @@ async def _get_redis():
 
 
 async def _cache_get(key: str) -> Optional[dict]:
-    """Return cached dict for key, or None on cache miss / Redis down."""
+    """Return cached dict for key, checking Memory first, then Redis."""
+    # Memory Check (Hot/Fallback)
+    if key in _memory_cache:
+        logger.info(f"[cache] MEM HIT  {key}")
+        return _memory_cache[key]
+
     redis = await _get_redis()
     if redis is None:
         return None
@@ -88,7 +95,10 @@ async def _cache_get(key: str) -> Optional[dict]:
         raw = await redis.get(key)
         if raw:
             logger.info(f"[cache] HIT  {key}")
-            return json.loads(raw)
+            parsed = json.loads(raw)
+            # Hydrate memory cache from Redis hit
+            _memory_cache[key] = parsed
+            return parsed
         logger.info(f"[cache] MISS {key}")
         return None
     except Exception as e:
@@ -97,7 +107,10 @@ async def _cache_get(key: str) -> Optional[dict]:
 
 
 async def _cache_set(key: str, value: dict, ttl: int = CACHE_TTL) -> None:
-    """Store dict in Redis with TTL. Silently fails if Redis is down."""
+    """Store dict in Memory and Redis. Silently fails if Redis is down."""
+    # Always store in memory for background task consistency
+    _memory_cache[key] = value
+    
     redis = await _get_redis()
     if redis is None:
         return
@@ -108,8 +121,8 @@ async def _cache_set(key: str, value: dict, ttl: int = CACHE_TTL) -> None:
         logger.warning(f"[cache] SET error: {e}")
 
 
-def _make_cache_key(address: str, hops: int, limit: int) -> str:
-    return f"{CACHE_KEY_PREFIX}:{address.lower()}:{hops}:{limit}"
+def _make_cache_key(address: str, hops: int, limit: int, page: int = 1) -> str:
+    return f"{CACHE_KEY_PREFIX}:{address.lower()}:{hops}:{limit}:{page}"
 
 
 # ---------------------------------------------------------------------------
@@ -186,8 +199,9 @@ def _sanitize_and_validate_address(address: str) -> str:
 
 class WalletAnalyzeRequest(BaseModel):
     address: str = Field(..., description="Ethereum wallet address")
-    hops: int = Field(1, ge=0, le=3)
-    limit: int = Field(5, ge=1, le=20)
+    hops: int = Field(1, ge=0, le=3, description="BFS depth")
+    limit: int = Field(10, ge=1, le=500, description="Transactions per page")
+    page: int = Field(1, ge=1, description="Current page number")
 
 
 # ---------------------------------------------------------------------------
@@ -303,7 +317,6 @@ async def login(request: Request):
 async def analyze(
     input_value: str,
     hops: int = 1,
-    current_user: str = Depends(get_current_user),
 ):
     """Backwards-compatible analysis endpoint."""
     cleaned = _sanitize_and_validate_address(input_value)
@@ -320,17 +333,17 @@ async def analyze(
 async def wallet_dashboard(
     address: str = Query(..., description="Ethereum wallet address"),
     hops: int = Query(1, ge=0, le=3),
-    limit: int = Query(5, ge=1, le=20),
-    current_user: str = Depends(get_current_user),
+    limit: int = Query(5, ge=1, le=500),
+    page: int = Query(1, ge=1),
 ):
     """Returns wallet summary (balance, smart contract status) + transactions."""
     cleaned = _sanitize_and_validate_address(address)
-    cache_key = _make_cache_key(cleaned, hops, limit)
+    cache_key = _make_cache_key(cleaned, hops, limit, page)
     cached = await _cache_get(cache_key)
     if cached:
         logger.info("Served /api/v1/dashboard from cache for address=%s", cleaned)
         return cached
-    result = await analyze_wallet(cleaned, hops, limit)
+    result = await analyze_wallet(cleaned, hops, limit, page)
     await _cache_set(cache_key, result)
     logger.info("Served /api/v1/dashboard for address=%s hops=%s limit=%s", cleaned, hops, limit)
     return result
@@ -339,7 +352,7 @@ async def wallet_dashboard(
 @app.post("/api/wallet/analyze")
 async def analyze_wallet_post(
     payload: WalletAnalyzeRequest,
-    current_user: str = Depends(get_current_user),
+    background_tasks: BackgroundTasks,
 ):
     """
     Primary API endpoint for frontend wallet analysis.
@@ -348,20 +361,38 @@ async def analyze_wallet_post(
     Results are cached in Redis for CACHE_TTL seconds.
     """
     cleaned = _sanitize_and_validate_address(payload.address)
-    cache_key = _make_cache_key(cleaned, payload.hops, payload.limit)
+    cache_key = _make_cache_key(cleaned, payload.hops, payload.limit, payload.page)
 
     cached = await _cache_get(cache_key)
     if cached:
         logger.info(
-            "Served /api/wallet/analyze from cache for address=%s hops=%s limit=%s",
-            cleaned, payload.hops, payload.limit,
+            "Served /api/wallet/analyze from cache for address=%s hops=%s limit=%s page=%s",
+            cleaned, payload.hops, payload.limit, payload.page,
         )
         return cached
 
-    result = await analyze_wallet(cleaned, payload.hops, payload.limit)
+    result = await analyze_wallet(cleaned, payload.hops, payload.limit, payload.page)
     await _cache_set(cache_key, result)
+
+    # If this was a Quick Analysis (hops=0) Page 1, proactively start a Deep Dive in the background
+    if payload.hops == 0 and payload.page == 1:
+        logger.info("[bg] Proactively starting Deep Dive for %s", cleaned)
+        background_tasks.add_task(_precache_deep_dive, cleaned, payload.limit)
+
     logger.info(
-        "Served /api/wallet/analyze for address=%s hops=%s limit=%s",
-        cleaned, payload.hops, payload.limit,
+        "Served /api/wallet/analyze for address=%s hops=%s limit=%s page=%s",
+        cleaned, payload.hops, payload.limit, payload.page,
     )
     return result
+
+
+async def _precache_deep_dive(address: str, limit: int):
+    """Worker for background caching of deep dive results."""
+    try:
+        # Standard deep dive is 1 hop
+        result = await analyze_wallet(address, hops=1, tx_limit=limit)
+        cache_key = _make_cache_key(address, 1, limit)
+        await _cache_set(cache_key, result)
+        logger.info("[bg] Deep Dive precached for %s", address)
+    except Exception as e:
+        logger.error("[bg] Precache failed for %s: %r", address, e)

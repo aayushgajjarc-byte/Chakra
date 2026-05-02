@@ -1,6 +1,6 @@
-import { Search, ChevronDown, Moon, User } from 'lucide-react'
+import { Search, ChevronDown, Moon, Sun, User } from 'lucide-react'
 
-export default function Navbar({ address, setAddress, network, setNetwork, onSearch, onLogout }) {
+export default function Navbar({ address, setAddress, network, setNetwork, onSearch, onLogout, theme, onToggleTheme }) {
   const networks = ['Ethereum', 'Bitcoin', 'Polygon']
 
   return (
@@ -9,23 +9,8 @@ export default function Navbar({ address, setAddress, network, setNetwork, onSea
       data-testid="navbar"
     >
       <img src="/chakra-logo.png" alt="CHAKRA" className="h-8 w-auto object-contain mr-4 flex-shrink-0" />
-      {/* Global Search */}
-      <div className="flex-1 max-w-md">
-        <div className="relative">
-          <Search
-            size={20}
-            className="absolute left-3 top-1/2 transform -translate-y-1/2 text-muted pointer-events-none"
-          />
-          <input
-            value={address}
-            onChange={(e) => setAddress(e.target.value)}
-            className="w-full bg-surface border border-border rounded-lg pl-10 pr-4 py-2 text-textPrimary placeholder-muted focus:outline-none focus:border-primary focus:ring-0 focus:shadow-[0_0_0_1px_#00F0FF] caret-primary transition-all"
-            placeholder="Search wallet / tx hash"
-            onKeyPress={(e) => e.key === 'Enter' && onSearch()}
-            data-testid="navbar-search-input"
-          />
-        </div>
-      </div>
+      {/* Empty center space */}
+      <div className="flex-1" />
 
       {/* Network Selector & Actions */}
       <div className="flex items-center space-x-4">
@@ -50,10 +35,16 @@ export default function Navbar({ address, setAddress, network, setNetwork, onSea
 
         {/* Dark Mode Toggle */}
         <button
+          onClick={onToggleTheme}
           className="p-2 rounded-lg hover:bg-border transition-colors"
           data-testid="dark-mode-toggle"
+          title={theme === 'dark' ? 'Switch to light mode' : 'Switch to dark mode'}
         >
-          <Moon size={20} className="text-textSecondary" />
+          {theme === 'dark' ? (
+            <Sun size={20} className="text-textSecondary" />
+          ) : (
+            <Moon size={20} className="text-textSecondary" />
+          )}
         </button>
 
         {/* Profile / Logout */}

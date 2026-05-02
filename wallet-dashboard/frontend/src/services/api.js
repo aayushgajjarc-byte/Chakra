@@ -41,16 +41,8 @@ export const clearAuthToken = () => {
 }
 
 // ---------------------------------------------------------------------------
-// Global 401 handler — redirects to /login when token is missing or expired
+// 401 handler removed
 // ---------------------------------------------------------------------------
-
-const _handle401 = () => {
-  console.warn('[api] 401 Unauthorized — clearing token and redirecting to /login')
-  clearAuthToken()
-  if (typeof window !== 'undefined' && window.location.pathname !== '/login') {
-    window.location.href = '/login'
-  }
-}
 
 // ---------------------------------------------------------------------------
 // Error class
@@ -92,25 +84,25 @@ const _request = async (url, options = {}) => {
     )
   }
 
-  // Global 401 handler
-  if (response.status === 401) {
-    _handle401()
-    throw new ApiError(
-      'Session expired or not authenticated. Please log in again.',
-      401
-    )
-  }
-
   if (!response.ok) {
     let detail = response.statusText
     try {
-      const errBody = await response.json()
-      detail = errBody.detail || errBody.message || detail
+      const errText = await response.text()
+      if (errText) {
+        const errBody = JSON.parse(errText)
+        detail = errBody.detail || errBody.message || detail
+      }
     } catch (_) { /* ignore parse error */ }
     throw new ApiError(`Request failed (${response.status}): ${detail}`, response.status)
   }
 
-  return response.json()
+  const text = await response.text()
+  try {
+    return text ? JSON.parse(text) : {}
+  } catch (parseErr) {
+    console.error('[api] Failed to parse JSON response:', text)
+    throw new ApiError(`Invalid response format: ${parseErr.message}`, response.status)
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -143,7 +135,15 @@ export const api = {
       throw new ApiError('Invalid username or password.', response.status)
     }
 
-    const data = await response.json()
+    const text = await response.text()
+    let data;
+    try {
+      data = text ? JSON.parse(text) : {}
+    } catch (parseErr) {
+      console.error('[api] Login response is not valid JSON:', text)
+      throw new ApiError('Invalid response from server.', 500)
+    }
+    
     if (!data?.access_token) {
       throw new ApiError('No token returned by server.', 500)
     }
@@ -156,10 +156,10 @@ export const api = {
    * POST /api/wallet/analyze — primary dashboard endpoint.
    * Token is automatically injected. 401 → redirect to login.
    */
-  async fetchWalletDashboard(address, hops = 1, limit = 10) {
+  async fetchWalletDashboard(address, hops = 1, limit = 10, page = 1) {
     return _request('/api/wallet/analyze', {
       method: 'POST',
-      body: JSON.stringify({ address, hops, limit }),
+      body: JSON.stringify({ address, hops, limit, page }),
     })
   },
 

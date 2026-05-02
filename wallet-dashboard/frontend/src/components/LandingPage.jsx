@@ -1,33 +1,71 @@
-import { useState, useEffect } from 'react'
 import { motion } from 'framer-motion'
 import { ArrowRight, Shield, Eye, Zap, TrendingUp, Activity, Users } from 'lucide-react'
 import SummaryCards from './SummaryCards'
 import TransactionsTable from './TransactionsTable'
 import RiskAnalyticsPanel from './RiskAnalyticsPanel'
-import { api } from '../services/api'
+
+// ---------------------------------------------------------------------------
+// Static mock data — no backend call needed for the landing page preview
+// ---------------------------------------------------------------------------
+const MOCK_DATA = {
+  balance: '4.8271',
+  currency: 'ETH',
+  transaction_count: 142,
+  transactions: [
+    {
+      hash: '0xa1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2',
+      from: '0xDemoSender1111111111111111111111111111',
+      to: '0xDemoReceiver2222222222222222222222222222',
+      value: '2.5',
+      timestamp: '2024-03-15T10:23:00Z',
+      direction: 'out',
+    },
+    {
+      hash: '0xb2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3',
+      from: '0xDemoSender3333333333333333333333333333',
+      to: '0xDemoReceiver4444444444444444444444444444',
+      value: '0.75',
+      timestamp: '2024-03-14T08:10:00Z',
+      direction: 'in',
+    },
+    {
+      hash: '0xc3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4',
+      from: '0xDemoSender5555555555555555555555555555',
+      to: '0xDemoReceiver6666666666666666666666666666',
+      value: '12.0',
+      timestamp: '2024-03-13T19:45:00Z',
+      direction: 'out',
+    },
+    {
+      hash: '0xd4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5',
+      from: '0xDemoSender7777777777777777777777777777',
+      to: '0xDemoReceiver8888888888888888888888888888',
+      value: '0.32',
+      timestamp: '2024-03-12T14:05:00Z',
+      direction: 'in',
+    },
+    {
+      hash: '0xe5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6',
+      from: '0xDemoSender9999999999999999999999999999',
+      to: '0xDemoReceiveAAAAAAAAAAAAAAAAAAAAAAAAAAAA',
+      value: '55.0',
+      timestamp: '2024-03-11T07:30:00Z',
+      direction: 'out',
+    },
+    {
+      hash: '0xf6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1',
+      from: '0xDemoSenderBBBBBBBBBBBBBBBBBBBBBBBBBBBB',
+      to: '0xDemoReceiverCCCCCCCCCCCCCCCCCCCCCCCCCCCC',
+      value: '1.1',
+      timestamp: '2024-03-10T22:15:00Z',
+      direction: 'in',
+    },
+  ],
+}
 
 export default function LandingPage({ onEnterDashboard }) {
-  const [dashboardData, setDashboardData] = useState(null)
-  const [loading, setLoading] = useState(false)
-  const [error, setError] = useState(null)
-  const [address] = useState('0x6eb40eD52793Fb7ca5Cf7f17d48147299d49B70E')
-
-  const fetchDashboardData = async () => {
-    setLoading(true)
-    setError(null)
-    try {
-      const json = await api.fetchWalletDashboard(address, 1, 10)
-      setDashboardData(json)
-    } catch (e) {
-      console.error(e)
-      setError('Unable to load dashboard preview. Please try again later.')
-    }
-    setLoading(false)
-  }
-
-  useEffect(() => {
-    fetchDashboardData()
-  }, [])
+  // Static mock — no loading state, no API calls
+  const dashboardData = MOCK_DATA
 
   const features = [
     {
@@ -166,10 +204,10 @@ export default function LandingPage({ onEnterDashboard }) {
             className="text-center mb-16"
           >
             <h2 className="text-4xl font-mono font-bold text-textPrimary mb-4">
-              Live Dashboard Preview
+              Dashboard Preview
             </h2>
             <p className="text-lg text-textSecondary max-w-2xl mx-auto">
-              Experience real-time blockchain analysis with live data from our intelligence platform.
+              A sample of the real-time blockchain analysis tools available inside the platform.
             </p>
           </motion.div>
 
@@ -180,46 +218,23 @@ export default function LandingPage({ onEnterDashboard }) {
             viewport={{ once: true }}
             className="bg-card/80 backdrop-blur-sm border border-border rounded-lg p-8"
           >
-            {error ? (
-              <div className="text-center py-12" data-testid="preview-error-state">
-                <p className="text-danger text-lg mb-4">{error}</p>
-                <button
-                  onClick={fetchDashboardData}
-                  className="bg-primary/10 border border-primary/20 text-primary px-6 py-2 rounded-lg hover:bg-primary/20 transition-colors"
-                  data-testid="preview-retry-button"
-                >
-                  Retry
-                </button>
-              </div>
-            ) : (
-              <>
-                {/* Summary Cards */}
-                <div className="mb-8">
-                  <SummaryCards data={dashboardData} loading={loading} />
-                </div>
+            {/* Summary Cards */}
+            <div className="mb-8">
+              <SummaryCards data={dashboardData} loading={false} />
+            </div>
 
-                {/* Transactions Table */}
-                <div className="mb-8">
-                  <h3 className="text-2xl font-bold text-textPrimary mb-6">Recent Transactions</h3>
-                  {dashboardData && dashboardData.transactions ? (
-                    <TransactionsTable
-                      transactions={dashboardData.transactions}
-                      currency={dashboardData.currency || 'ETH'}
-                      loading={loading}
-                    />
-                  ) : (
-                    <div className="bg-background/50 border border-border rounded-lg p-8 text-center">
-                      <p className="text-textSecondary">Loading transaction data...</p>
-                    </div>
-                  )}
-                </div>
+            {/* Transactions Table */}
+            <div className="mb-8">
+              <h3 className="text-2xl font-bold text-textPrimary mb-6">Recent Transactions</h3>
+              <TransactionsTable
+                transactions={dashboardData.transactions}
+                currency={dashboardData.currency}
+                loading={false}
+              />
+            </div>
 
-                {/* Risk Analytics Panel */}
-                {dashboardData && dashboardData.transactions && dashboardData.transactions.length > 0 && (
-                  <RiskAnalyticsPanel data={dashboardData} loading={loading} />
-                )}
-              </>
-            )}
+            {/* Risk Analytics Panel */}
+            <RiskAnalyticsPanel data={dashboardData} loading={false} />
           </motion.div>
         </div>
       </section>

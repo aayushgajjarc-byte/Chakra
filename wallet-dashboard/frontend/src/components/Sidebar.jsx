@@ -1,4 +1,3 @@
-import { useState } from 'react'
 import { Home, Search, BarChart3, Activity, Settings } from 'lucide-react'
 
 export default function Sidebar({ activeView, setActiveView, collapsed, setCollapsed }) {

@@ -5,6 +5,42 @@
 @tailwind components;
 @tailwind utilities;
 
+:root {
+  --color-background: #0b0f17;
+  --color-surface: #111827;
+  --color-card: rgba(17, 24, 39, 0.75);
+  --color-hover: #1f2937;
+  --color-border: #1f2937;
+  --color-border-hover: rgba(0, 240, 255, 0.4);
+  --color-primary: #00f0ff;
+  --color-secondary: #3b82f6;
+  --color-danger: #ef4444;
+  --color-risk: #ef4444;
+  --color-warning: #f59e0b;
+  --color-success: #22c55e;
+  --color-text-primary: #f9fafb;
+  --color-text-secondary: #9ca3af;
+  --color-muted: #6b7280;
+}
+
+[data-theme='light'] {
+  --color-background: #f5f8fb;
+  --color-surface: #ffffff;
+  --color-card: rgba(255, 255, 255, 0.85);
+  --color-hover: #eef2f7;
+  --color-border: #d6deea;
+  --color-border-hover: rgba(0, 135, 196, 0.35);
+  --color-primary: #0087c4;
+  --color-secondary: #2563eb;
+  --color-danger: #dc2626;
+  --color-risk: #dc2626;
+  --color-warning: #d97706;
+  --color-success: #16a34a;
+  --color-text-primary: #111827;
+  --color-text-secondary: #4b5563;
+  --color-muted: #6b7280;
+}
+
 * {
   box-sizing: border-box;
 }
@@ -14,21 +50,22 @@ body {
   font-family: 'Inter', sans-serif;
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
-  background-color: #0B0F17;
-  color: #F9FAFB;
+  background-color: var(--color-background);
+  color: var(--color-text-primary);
+  transition: background-color 0.2s ease, color 0.2s ease;
 }
 
 /* Ensure all inputs have proper text visibility */
 input,
 select,
 textarea {
-  color: #F9FAFB !important;
+  color: var(--color-text-primary) !important;
 }
 
 input::placeholder,
 select::placeholder,
 textarea::placeholder {
-  color: #6B7280 !important;
+  color: var(--color-muted) !important;
 }
 
 /* Custom scrollbar */
@@ -38,20 +75,20 @@ textarea::placeholder {
 }
 
 ::-webkit-scrollbar-track {
-  background: #111827;
+  background: var(--color-surface);
 }
 
 ::-webkit-scrollbar-thumb {
-  background: #1F2937;
+  background: var(--color-border);
   border-radius: 4px;
 }
 
 ::-webkit-scrollbar-thumb:hover {
-  background: #374151;
+  background: var(--color-hover);
 }
 
 /* Selection color */
 ::selection {
   background-color: rgba(0, 240, 255, 0.3);
-  color: #F9FAFB;
+  color: var(--color-text-primary);
 }

@@ -1,10 +1,9 @@
 import { motion } from 'framer-motion'
-import { ArrowRightLeft, Download, Activity } from 'lucide-react'
+import { useRef } from 'react'
+import { Search, Activity, ShieldCheck, RefreshCw, Layers } from 'lucide-react'
 import SummaryCards from './SummaryCards'
 import TransactionsTable from './TransactionsTable'
 import RiskAnalyticsPanel from './RiskAnalyticsPanel'
-import ErrorBanner from './ui/ErrorBanner'
-import EmptyState from './ui/EmptyState'
 
 export default function Dashboard({
   address,
@@ -17,155 +16,200 @@ export default function Dashboard({
   loading,
   error,
   onScan,
-  onGraph,
-  onClearError,
+  onPageChange,
 }) {
-  return (
-    <motion.div
-      className="max-w-7xl mx-auto space-y-8"
-      initial={{ opacity: 0, y: 20 }}
-      animate={{ opacity: 1, y: 0 }}
-      transition={{ duration: 0.6 }}
-      data-testid="dashboard-container"
-    >
-      {/* Error Banner */}
-      {error && (
-        <ErrorBanner
-          message={error}
-          onRetry={onScan}
-          onDismiss={onClearError}
-        />
-      )}
+  const overviewRef = useRef(null)
+  const transactionsRef = useRef(null)
+  const riskRef = useRef(null)
 
-      {/* Header */}
-      <div className="bg-card backdrop-blur-xl border border-border rounded-lg p-6">
-        <div className="border-b border-border pb-4 mb-6">
-          <div className="flex items-center justify-between">
-            <div className="flex items-center gap-3">
-              <div className="w-3 h-3 bg-success rounded-full animate-pulse" data-testid="status-indicator"></div>
-              <h1 className="text-2xl font-mono font-bold text-textPrimary">
-                Real-time blockchain intelligence overview
-              </h1>
-            </div>
-            <button
-              className="bg-primary/10 border border-primary/20 text-primary px-4 py-2 rounded-lg flex items-center gap-2 hover:shadow-glow transition-all duration-300"
-              data-testid="export-button"
-            >
-              <Download size={16} />
-              Export
-            </button>
-          </div>
+  // Determine what to show based on the analysis type (hops)
+  const isInitial = !data && !loading
+  const isQuick = data && data.hops === 0
+  const isDeep = data && data.hops > 0
+
+  const SearchBar = ({ isHero = false }) => (
+    <div className={`w-full ${isHero ? 'max-w-2xl' : 'max-w-4xl mb-8'} bg-card border border-border p-6 rounded-3xl shadow-2xl space-y-6 backdrop-blur-xl mx-auto transition-all duration-500`}>
+      <div className="relative group">
+        <div className="absolute left-6 top-1/2 -translate-y-1/2 text-muted group-focus-within:text-primary transition-colors">
+          <Search size={24} />
         </div>
+        <input
+          value={address}
+          onChange={(e) => setAddress(e.target.value)}
+          disabled={loading}
+          className="w-full bg-surface border-2 border-border rounded-2xl pl-16 pr-6 py-4 text-xl text-textPrimary placeholder-muted focus:outline-none focus:border-primary focus:ring-0 transition-all disabled:opacity-50"
+          placeholder="Enter Wallet Address (0x...)"
+          onKeyPress={(e) => e.key === 'Enter' && onScan(true)}
+        />
+      </div>
+      <div className="flex gap-4">
+        <button
+          onClick={() => onScan(true)}
+          disabled={loading}
+          className="flex-1 bg-primary/10 border border-primary/30 text-primary py-4 rounded-xl font-bold text-lg hover:bg-primary/20 transition-all active:scale-95 flex items-center justify-center gap-2 disabled:opacity-50"
+        >
+          <Activity size={20} />
+          Quick Analysis
+        </button>
+        <button
+          onClick={() => onScan(false)}
+          disabled={loading}
+          className="flex-1 bg-primary text-background py-5 rounded-xl font-bold text-lg shadow-glow hover:opacity-90 transition-all active:scale-95 flex items-center justify-center gap-2 disabled:opacity-50"
+        >
+          <ShieldCheck size={20} />
+          Deep Dive
+        </button>
+      </div>
+    </div>
+  )
 
-        {/* Summary Cards */}
-        <SummaryCards data={data} loading={loading} error={error} />
+  return (
+    <div className="p-8 max-w-7xl mx-auto min-h-[80vh] flex flex-col" data-testid="dashboard-container">
+      
+      {/* 1. Header Section */}
+      <div className={`flex flex-col transition-all duration-700 ${isInitial ? 'flex-1 justify-center' : 'pt-4'}`}>
+        {isInitial && (
+          <motion.div 
+            initial={{ opacity: 0, y: -20 }}
+            animate={{ opacity: 1, y: 0 }}
+            className="text-center space-y-4 mb-12"
+          >
+            <h1 className="text-6xl font-mono font-bold text-textPrimary tracking-tight">
+              CHAKRA <span className="text-primary shadow-glow-text">AI</span>
+            </h1>
+            <p className="text-textSecondary text-xl max-w-2xl mx-auto leading-relaxed">
+              Precision blockchain forensics. Scan any Ethereum wallet to instantly identify risks.
+            </p>
+          </motion.div>
+        )}
+        <SearchBar isHero={isInitial} />
       </div>
 
-      {/* Transactions Table */}
-      <motion.div
-        className="bg-card backdrop-blur-xl border border-border rounded-lg overflow-hidden"
-        initial={{ opacity: 0, y: 20 }}
-        animate={{ opacity: 1, y: 0 }}
-        transition={{ duration: 0.6, delay: 0.2 }}
-      >
-        <div className="p-6 border-b border-border">
-          <div className="flex justify-between items-center">
-            <h2 className="text-2xl font-mono font-bold text-textPrimary">
-              Transaction Explorer
-            </h2>
-            <div className="flex items-center gap-4 flex-wrap">
-              <div className="flex items-center gap-2">
-                <span className="text-sm text-textSecondary">Hop Count:</span>
-                <select
-                  value={hops}
-                  onChange={(e) => setHops(Number(e.target.value))}
-                  className="bg-surface border border-border rounded-lg px-3 py-2 text-textPrimary placeholder-muted focus:outline-none focus:border-primary focus:ring-0 focus:shadow-[0_0_0_1px_#00F0FF] caret-primary transition-all"
-                  data-testid="hop-count-select"
-                  title="Number of BFS hops to trace from the seed wallet"
-                >
-                  {[0, 1, 2, 3].map((n) => (
-                    <option key={n} value={n}>
-                      {n === 0 ? '0 (balance only)' : n}
-                    </option>
-                  ))}
-                </select>
-              </div>
-              <div className="flex items-center gap-2">
-                <span className="text-sm text-textSecondary">Tx Limit:</span>
-                <select
-                  value={limit}
-                  onChange={(e) => setLimit(Number(e.target.value))}
-                  className="bg-surface border border-border rounded-lg px-3 py-2 text-textPrimary placeholder-muted focus:outline-none focus:border-primary focus:ring-0 focus:shadow-[0_0_0_1px_#00F0FF] caret-primary transition-all"
-                  data-testid="limit-select"
-                  title="Max transactions returned per BFS node"
-                >
-                  {[5, 10, 15, 20, 50].map((n) => (
-                    <option key={n} value={n}>
-                      {n}
-                    </option>
-                  ))}
-                </select>
-              </div>
-              {/* Re-scan with current settings */}
-              <button
-                onClick={onScan}
-                disabled={loading}
-                className="bg-primary text-background font-semibold px-4 py-2 rounded-lg flex items-center gap-2 hover:opacity-90 active:scale-95 transition-all duration-200 disabled:opacity-50 disabled:cursor-not-allowed shadow-glow"
-                data-testid="rescan-button"
-                title="Apply hops/limit and re-scan"
-              >
-                <Activity size={15} />
-                {loading ? 'Scanning…' : 'Re-scan'}
-              </button>
-              <button
-                onClick={onGraph}
-                disabled={!data || loading}
-                className="bg-primary/10 border border-primary/20 text-primary px-6 py-2 rounded-lg flex items-center gap-2 hover:shadow-glow transition-all duration-300 disabled:opacity-50 disabled:cursor-not-allowed"
-                data-testid="view-graph-button"
-              >
-                View Graph <ArrowRightLeft size={16} />
-              </button>
-            </div>
-            <p className="text-xs text-muted mt-2">
-              Change hops or limit then click <span className="text-primary font-semibold">Re-scan</span> to apply.
+      {/* 2. Loading State */}
+      {loading && (
+        <motion.div 
+          initial={{ opacity: 0, y: 10 }}
+          animate={{ opacity: 1, y: 0 }}
+          className="flex flex-col items-center justify-center space-y-8 py-20"
+        >
+          <div className="relative">
+            <div className="w-20 h-20 border-4 border-primary/20 rounded-full"></div>
+            <div className="w-20 h-20 border-4 border-primary border-t-transparent rounded-full animate-spin absolute top-0 left-0"></div>
+          </div>
+          <div className="text-center space-y-2">
+            <h3 className="text-xl font-mono font-bold text-textPrimary animate-pulse uppercase tracking-widest">
+              Scanning Ethereum...
+            </h3>
+            <p className="text-textSecondary font-mono italic text-sm">
+              Analyzing blockchain nodes & calculating risk...
             </p>
           </div>
-        </div>
-
-        {loading ? (
-          <div className="p-12 text-center" data-testid="loading-state">
-            <div className="w-12 h-12 border-4 border-primary border-t-transparent rounded-full animate-spin mx-auto mb-4"></div>
-            <p className="text-textSecondary text-lg">Loading transaction data...</p>
-          </div>
-        ) : data && data.transactions && data.transactions.length > 0 ? (
-          <TransactionsTable
-            transactions={data.transactions}
-            currency={data.currency || 'ETH'}
-            loading={loading}
-          />
-        ) : (
-          <EmptyState
-            icon={Activity}
-            title="No Transaction Data"
-            description="No transactions found for this wallet. Please scan a different wallet or adjust your search parameters."
-            action={{
-              label: 'Scan Wallet',
-              onClick: onScan,
-            }}
-          />
-        )}
-      </motion.div>
-
-      {/* Risk & Analytics Panel */}
-      {data && data.transactions && data.transactions.length > 0 && (
-        <motion.div
-          initial={{ opacity: 0, y: 20 }}
-          animate={{ opacity: 1, y: 0 }}
-          transition={{ duration: 0.6, delay: 0.4 }}
-        >
-          <RiskAnalyticsPanel data={data} loading={loading} />
         </motion.div>
       )}
-    </motion.div>
+
+      {/* 3. Results Section */}
+      {(isQuick || isDeep) && !loading && (
+        <motion.div 
+          initial={{ opacity: 0, y: 20 }}
+          animate={{ opacity: 1, y: 0 }}
+          className="space-y-10 mt-4"
+        >
+          {/* Results Status Header with Controls */}
+          <div className="flex flex-col md:flex-row md:items-center justify-between gap-6 bg-card/50 p-6 border border-border rounded-2xl backdrop-blur-sm">
+            <div className="flex items-center gap-4">
+               <div className={`w-3 h-3 rounded-full ${isQuick ? 'bg-warning shadow-[0_0_15px_rgba(255,171,0,0.5)]' : 'bg-success shadow-[0_0_15px_rgba(0,240,255,0.5)]'}`}></div>
+               <div>
+                  <h2 className="text-lg font-mono font-bold text-textPrimary leading-none uppercase">
+                    {isQuick ? 'Quick Snapshot' : 'Forensic Intelligence Dossier'}
+                  </h2>
+                  <p className="text-[10px] text-muted mt-2 font-mono uppercase tracking-widest opacity-60">
+                    Target: {address}
+                  </p>
+               </div>
+            </div>
+            
+            {/* Contextual Controls */}
+            <div className="flex items-center gap-4">
+              {isDeep && (
+                <div className="flex items-center gap-4 border-l border-border pl-4">
+                  <div className="flex items-center gap-2">
+                    <span className="text-[10px] font-mono text-muted uppercase">Hops:</span>
+                    <select
+                      value={hops}
+                      onChange={(e) => setHops(Number(e.target.value))}
+                      className="bg-surface border border-border rounded-lg px-2 py-1 text-xs text-textPrimary focus:outline-none"
+                    >
+                      <option value={1}>1 Hop</option>
+                      <option value={2}>2 Hops</option>
+                    </select>
+                  </div>
+                  <div className="flex items-center gap-2">
+                    <span className="text-[10px] font-mono text-muted uppercase">Size:</span>
+                    <select
+                      value={limit}
+                      onChange={(e) => setLimit(Number(e.target.value))}
+                      className="bg-surface border border-border rounded-lg px-2 py-1 text-xs text-textPrimary focus:outline-none"
+                    >
+                      <option value={10}>10 per page</option>
+                      <option value={50}>50 per page</option>
+                      <option value={100}>100 per page</option>
+                    </select>
+                  </div>
+                </div>
+              )}
+              <button
+                onClick={() => onScan(isQuick)}
+                className="bg-primary/10 text-primary p-2 rounded-lg hover:bg-primary/20 transition-all"
+                title="Refresh current view"
+              >
+                <RefreshCw size={16} />
+              </button>
+            </div>
+          </div>
+
+          {/* Cards Section */}
+          <div ref={overviewRef}>
+            <SummaryCards data={data} loading={loading} error={error} />
+          </div>
+
+          {/* Forensic Sections (Only for Deep Dive) */}
+          {isDeep && (
+            <motion.div
+              initial={{ opacity: 0, y: 30 }}
+              animate={{ opacity: 1, y: 0 }}
+              transition={{ delay: 0.1 }}
+              className="space-y-10"
+            >
+              <div ref={transactionsRef} className="bg-card backdrop-blur-xl border border-border rounded-3xl overflow-hidden shadow-2xl">
+                <div className="p-8 border-b border-border flex justify-between items-center">
+                  <div className="flex items-center gap-3">
+                    <Layers className="text-primary" size={24} />
+                    <h2 className="text-2xl font-mono font-bold text-textPrimary uppercase tracking-tighter">Transaction Explorer</h2>
+                  </div>
+                  <div className="flex items-center gap-4">
+                    <div className="bg-surface px-4 py-2 rounded-xl border border-border text-xs font-mono text-textSecondary">
+                      Showing <span className="text-primary font-bold">{data?.transactions?.length || 0}</span> of <span className="text-textPrimary font-bold">{data?.transaction_count?.toLocaleString() || 0}</span>
+                    </div>
+                  </div>
+                </div>
+                <TransactionsTable
+                  transactions={data?.transactions || []}
+                  currency={data?.currency || 'ETH'}
+                  loading={loading}
+                  totalCount={data?.transaction_count || 0}
+                  onPageChange={onPageChange}
+                  currentPage={data?.page || 1}
+                  pageSize={limit}
+                />
+              </div>
+
+              <div ref={riskRef}>
+                <RiskAnalyticsPanel data={data} loading={loading} />
+              </div>
+            </motion.div>
+          )}
+        </motion.div>
+      )}
+    </div>
   )
 }

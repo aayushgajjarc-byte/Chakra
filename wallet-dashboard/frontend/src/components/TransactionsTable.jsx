@@ -2,13 +2,19 @@ import { useState, useMemo } from 'react'
 import { ArrowUpDown, Search, Filter } from 'lucide-react'
 import { TableSkeleton } from './ui/Skeleton'
 
-export default function TransactionsTable({ transactions, currency, loading }) {
+export default function TransactionsTable({ 
+  transactions, 
+  currency, 
+  loading, 
+  totalCount = 0, 
+  onPageChange, 
+  currentPage = 1,
+  pageSize = 10
+}) {
   const [sortField, setSortField] = useState('time')
   const [sortDirection, setSortDirection] = useState('desc')
   const [searchTerm, setSearchTerm] = useState('')
-  const [currentPage, setCurrentPage] = useState(1)
-  const [riskFilter, setRiskFilter] = useState('ALL')
-  const itemsPerPage = 10
+  const itemsPerPage = pageSize // Match the dynamic limit from the dashboard
 
   const sortedAndFilteredTransactions = useMemo(() => {
     if (!transactions || transactions.length === 0) return []
@@ -19,10 +25,6 @@ export default function TransactionsTable({ transactions, currency, loading }) {
         (tx.from && tx.from.toLowerCase().includes(searchTerm.toLowerCase())) ||
         (tx.to && tx.to.toLowerCase().includes(searchTerm.toLowerCase()))
     )
-
-    if (riskFilter !== 'ALL') {
-      filtered = filtered.filter((tx) => getRiskFlag(tx) === riskFilter)
-    }
 
     filtered.sort((a, b) => {
       let aVal = a[sortField]
@@ -42,14 +44,9 @@ export default function TransactionsTable({ transactions, currency, loading }) {
     })
 
     return filtered
-  }, [transactions, sortField, sortDirection, searchTerm, riskFilter])
+  }, [transactions, sortField, sortDirection, searchTerm])
 
-  const paginatedTransactions = useMemo(() => {
-    const startIndex = (currentPage - 1) * itemsPerPage
-    return sortedAndFilteredTransactions.slice(startIndex, startIndex + itemsPerPage)
-  }, [sortedAndFilteredTransactions, currentPage])
-
-  const totalPages = Math.ceil(sortedAndFilteredTransactions.length / itemsPerPage)
+  const totalPages = Math.ceil(totalCount / itemsPerPage)
 
   const handleSort = (field) => {
     if (sortField === field) {
@@ -85,24 +82,13 @@ export default function TransactionsTable({ transactions, currency, loading }) {
               value={searchTerm}
               onChange={(e) => setSearchTerm(e.target.value)}
               className="bg-surface border border-border rounded-lg pl-10 pr-4 py-2 text-textPrimary placeholder-muted focus:outline-none focus:border-primary focus:ring-0 focus:shadow-[0_0_0_1px_#00F0FF] caret-primary transition-all"
-              placeholder="Search transactions..."
+              placeholder="Search local page..."
               data-testid="transaction-search-input"
             />
           </div>
-          <div className="flex items-center gap-2">
-            <Filter size={16} className="text-muted" />
-            <select
-              value={riskFilter}
-              onChange={(e) => setRiskFilter(e.target.value)}
-              className="bg-surface border border-border rounded-lg px-3 py-2 text-textPrimary placeholder-muted focus:outline-none focus:border-primary focus:ring-0 focus:shadow-[0_0_0_1px_#00F0FF] caret-primary transition-all"
-              data-testid="risk-filter-select"
-            >
-              <option value="ALL">All Risk Levels</option>
-              <option value="LOW">Low Risk</option>
-              <option value="MEDIUM">Medium Risk</option>
-              <option value="HIGH">High Risk</option>
-            </select>
-          </div>
+        </div>
+        <div className="text-xs text-muted">
+          Showing {totalCount > 0 ? (currentPage - 1) * itemsPerPage + 1 : 0} - {Math.min(currentPage * itemsPerPage, totalCount)} of {totalCount.toLocaleString()} total
         </div>
       </div>
 
@@ -111,65 +97,21 @@ export default function TransactionsTable({ transactions, currency, loading }) {
         <table className="w-full">
           <thead className="bg-surface sticky top-0">
             <tr>
-              <th className="px-6 py-4 text-left text-xs font-medium text-textSecondary uppercase tracking-wider">
-                <button
-                  onClick={() => handleSort('hash')}
-                  className="flex items-center hover:text-textPrimary transition-colors"
-                  data-testid="sort-hash-button"
-                >
-                  Tx Hash <ArrowUpDown size={14} className="ml-1" />
-                </button>
-              </th>
-              <th className="px-6 py-4 text-left text-xs font-medium text-textSecondary uppercase tracking-wider">
-                <button
-                  onClick={() => handleSort('from')}
-                  className="flex items-center hover:text-textPrimary transition-colors"
-                  data-testid="sort-from-button"
-                >
-                  From <ArrowUpDown size={14} className="ml-1" />
-                </button>
-              </th>
-              <th className="px-6 py-4 text-left text-xs font-medium text-textSecondary uppercase tracking-wider">
-                <button
-                  onClick={() => handleSort('to')}
-                  className="flex items-center hover:text-textPrimary transition-colors"
-                  data-testid="sort-to-button"
-                >
-                  To <ArrowUpDown size={14} className="ml-1" />
-                </button>
-              </th>
-              <th className="px-6 py-4 text-left text-xs font-medium text-textSecondary uppercase tracking-wider">
-                <button
-                  onClick={() => handleSort('value')}
-                  className="flex items-center hover:text-textPrimary transition-colors"
-                  data-testid="sort-value-button"
-                >
-                  Amount <ArrowUpDown size={14} className="ml-1" />
-                </button>
-              </th>
-              <th className="px-6 py-4 text-left text-xs font-medium text-textSecondary uppercase tracking-wider">
-                <button
-                  onClick={() => handleSort('time')}
-                  className="flex items-center hover:text-textPrimary transition-colors"
-                  data-testid="sort-time-button"
-                >
-                  Timestamp <ArrowUpDown size={14} className="ml-1" />
-                </button>
-              </th>
-              <th className="px-6 py-4 text-left text-xs font-medium text-textSecondary uppercase tracking-wider">
-                Risk Flag
-              </th>
+              <th className="px-6 py-4 text-left text-xs font-medium text-textSecondary uppercase tracking-wider">Tx Hash</th>
+              <th className="px-6 py-4 text-left text-xs font-medium text-textSecondary uppercase tracking-wider">From</th>
+              <th className="px-6 py-4 text-left text-xs font-medium text-textSecondary uppercase tracking-wider">To</th>
+              <th className="px-6 py-4 text-left text-xs font-medium text-textSecondary uppercase tracking-wider">Amount</th>
+              <th className="px-6 py-4 text-left text-xs font-medium text-textSecondary uppercase tracking-wider">Timestamp</th>
+              <th className="px-6 py-4 text-left text-xs font-medium text-textSecondary uppercase tracking-wider">Risk Flag</th>
             </tr>
           </thead>
           <tbody className="divide-y divide-border">
-            {paginatedTransactions.map((tx, index) => {
+            {sortedAndFilteredTransactions.map((tx, index) => {
               const risk = getRiskFlag(tx)
-              const rowIndex = (currentPage - 1) * itemsPerPage + index
               return (
                 <tr
-                  key={tx.hash ? `${tx.hash}-${rowIndex}` : `row-${rowIndex}`}
-                  className="hover:bg-background/50 transition-all duration-200 hover:shadow-glow border-l-2 border-l-transparent hover:border-l-primary"
-                  data-testid={`transaction-row-${index}`}
+                  key={tx.hash ? `${tx.hash}-${index}` : `row-${index}`}
+                  className="hover:bg-background/50 transition-all duration-200"
                 >
                   <td className="px-6 py-4 whitespace-nowrap text-sm font-mono text-primary">
                     {tx.hash ? `${tx.hash.slice(0, 10)}...` : '—'}
@@ -187,29 +129,13 @@ export default function TransactionsTable({ transactions, currency, loading }) {
                     {tx.time ? new Date(tx.time).toLocaleString() : '—'}
                   </td>
                   <td className="px-6 py-4 whitespace-nowrap">
-                    <div className="flex items-center gap-2">
-                      <div
-                        className={`w-2 h-2 rounded-full ${
-                          risk === 'HIGH'
-                            ? 'bg-danger'
-                            : risk === 'MEDIUM'
-                            ? 'bg-warning'
-                            : 'bg-success'
-                        }`}
-                      ></div>
-                      <span
-                        className={`inline-flex px-2 py-1 text-xs font-semibold rounded-full ${
-                          risk === 'HIGH'
-                            ? 'bg-danger/20 text-danger border border-danger/30'
-                            : risk === 'MEDIUM'
-                            ? 'bg-warning/20 text-warning border border-warning/30'
-                            : 'bg-success/20 text-success border border-success/30'
-                        }`}
-                        data-testid={`risk-badge-${risk.toLowerCase()}`}
-                      >
-                        {risk}
-                      </span>
-                    </div>
+                    <span className={`inline-flex px-2 py-1 text-xs font-semibold rounded-full ${
+                      risk === 'HIGH' ? 'bg-danger/20 text-danger border border-danger/30' :
+                      risk === 'MEDIUM' ? 'bg-warning/20 text-warning border border-warning/30' :
+                      'bg-success/20 text-success border border-success/30'
+                    }`}>
+                      {risk}
+                    </span>
                   </td>
                 </tr>
               )
@@ -218,48 +144,31 @@ export default function TransactionsTable({ transactions, currency, loading }) {
         </table>
       </div>
 
-      {/* Pagination */}
+      {/* Pagination Controls */}
       <div className="px-6 py-4 border-t border-border flex items-center justify-between">
-        <div className="text-sm text-textSecondary" data-testid="pagination-info">
-          Showing {(currentPage - 1) * itemsPerPage + 1} to{' '}
-          {Math.min(currentPage * itemsPerPage, sortedAndFilteredTransactions.length)} of{' '}
-          {sortedAndFilteredTransactions.length} transactions
-        </div>
         <div className="flex space-x-2">
           <button
-            onClick={() => setCurrentPage(Math.max(1, currentPage - 1))}
+            onClick={() => onPageChange(currentPage - 1)}
             disabled={currentPage === 1}
             className="px-3 py-1 border border-border rounded text-textSecondary hover:bg-border disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
-            data-testid="pagination-prev-button"
           >
             Previous
           </button>
-          {[...Array(Math.min(5, totalPages))].map((_, i) => {
-            const pageNum = Math.max(1, Math.min(totalPages - 4, currentPage - 2)) + i
-            if (pageNum > totalPages) return null
-            return (
-              <button
-                key={pageNum}
-                onClick={() => setCurrentPage(pageNum)}
-                className={`px-3 py-1 border rounded transition-all ${
-                  currentPage === pageNum
-                    ? 'border-primary text-primary shadow-glow'
-                    : 'border-border text-textSecondary hover:bg-border'
-                }`}
-                data-testid={`pagination-page-${pageNum}`}
-              >
-                {pageNum}
-              </button>
-            )
-          })}
+          
+          <div className="flex items-center px-4 text-sm font-mono text-primary">
+            Page {currentPage} of {totalPages || 1}
+          </div>
+
           <button
-            onClick={() => setCurrentPage(Math.min(totalPages, currentPage + 1))}
-            disabled={currentPage === totalPages}
+            onClick={() => onPageChange(currentPage + 1)}
+            disabled={currentPage >= totalPages}
             className="px-3 py-1 border border-border rounded text-textSecondary hover:bg-border disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
-            data-testid="pagination-next-button"
           >
             Next
           </button>
+        </div>
+        <div className="text-xs text-muted uppercase tracking-widest">
+          Live Blockchain Paging
         </div>
       </div>
     </div>

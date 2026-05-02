@@ -1,0 +1,45 @@
+services:
+  # ---------------------------------------------------------------------------
+  # 1. WALLET BACKEND (FastAPI / Python)
+  # ---------------------------------------------------------------------------
+  - type: web
+    name: wallet-backend
+    env: python
+    plan: free
+    region: ohio
+    rootDir: wallet-dashboard/backend
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn main:app -w 4 -k uvicorn.workers.UvicornWorker --bind 0.0.0.0:$PORT
+    envVars:
+      - key: ETHERSCAN_API_KEY
+        sync: false
+      - key: JWT_SECRET
+        generateValue: true
+      - key: DEMO_USERNAME
+        value: demo
+      - key: DEMO_PASSWORD
+        value: demo
+      - key: RATE_LIMIT_PER_MINUTE
+        value: "60"
+
+  # ---------------------------------------------------------------------------
+  # 2. WALLET FRONTEND (React / Vite / Static Site)
+  # ---------------------------------------------------------------------------
+  - type: web
+    name: wallet-frontend
+    env: static
+    # No 'plan: free' here, Static Sites are free and sometimes the field
+    # causes validation errors when combined with 'env: static'.
+    rootDir: wallet-dashboard/frontend
+    buildCommand: npm install && npm run build
+    staticPublishPath: dist
+    routes:
+      - type: rewrite
+        source: /*
+        destination: /index.html
+    envVars:
+      - key: VITE_API_BASE_URL
+        fromService:
+          type: web
+          name: wallet-backend
+          property: host

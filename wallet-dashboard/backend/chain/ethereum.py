@@ -167,6 +167,97 @@ async def fetch_latest_block_number() -> int:
 MAX_PAGINATION_DEPTH: int = 10
 
 
+# ---------------------------------------------------------------------------
+# Phase 2 -- Paged Fetcher & Fast Counter
+# ---------------------------------------------------------------------------
+
+async def _fetch_total_count(address: str, action: str) -> int:
+    """
+    Quickly estimate the total number of transactions by using a sliding block window.
+    Bypasses Etherscan's 10,000-row pagination limit by shifting startblock instead
+    of incrementing page numbers.
+    """
+    total = 0
+    current_start = 0
+    limit = 10000
+    pool = get_etherscan_pool()
+    retries = 0
+    
+    while True:
+        params = {
+            "chainid": CHAIN_ID_ETHEREUM,
+            "module": "account",
+            "action": action,
+            "address": address,
+            "startblock": current_start,
+            "endblock": 99999999,
+            "page": 1,
+            "offset": limit,
+            "sort": "asc",
+        }
+        try:
+            data = await pool.fetch(ETHERSCAN_URL, params)
+            if data.get("status") == "1":
+                rows = data.get("result", [])
+                total += len(rows)
+                logger.info(f"[ethereum] Count scan: Found {len(rows)} rows (Total: {total}). Sliding window...")
+                
+                if len(rows) < limit:
+                    break
+                
+                # Slide window: next fetch starts after the last block we saw
+                last_block = int(rows[-1].get("blockNumber", current_start))
+                current_start = last_block + 1
+                retries = 0
+            elif "No transactions found" in str(data.get("result", "")):
+                break
+            else:
+                retries += 1
+                if retries > 2: break
+                await asyncio.sleep(1.0)
+        except Exception as e:
+            logger.error(f"[ethereum] Count scan exception: {e}")
+            break
+            
+    return total
+
+async def _fetch_paged(
+    address: str,
+    action: str,
+    limit: int = 50,
+    page: int = 1,
+    sort: str = "desc",
+) -> List[Dict[str, Any]]:
+    """
+    Fetch a specific number of transactions using Etherscan pagination.
+    This is significantly faster than block-range fetching for high-volume wallets
+    because it stops as soon as the limit is reached.
+    """
+    params = {
+        "chainid": CHAIN_ID_ETHEREUM,
+        "module": "account",
+        "action": action,
+        "address": address,
+        "page": page,
+        "offset": limit,
+        "sort": sort,
+    }
+    pool = get_etherscan_pool()
+    t0 = time.monotonic()
+    logger.debug(f"[ethereum] API paged: action={action} addr={address[:10]}... limit={limit}")
+    
+    try:
+        data = await pool.fetch(ETHERSCAN_URL, params)
+        if data.get("status") == "1":
+            result = data.get("result", [])
+            logger.info(f"[ethereum] {action} paged OK: {len(result)} rows in {time.monotonic()-t0:.2f}s")
+            return result
+        return []
+    except Exception as e:
+        logger.error(f"[ethereum] _fetch_paged({action}) error: {e}")
+        return []
+
+
 async def _fetch_range(
     address: str,
     action: str,
@@ -190,7 +281,7 @@ async def _fetch_range(
         "address": address,
         "startblock": start_block,
         "endblock": end_block,
-        "sort": "asc",
+        "sort": "desc",  # Use desc for faster recent-first fetching
     }
     pool = get_etherscan_pool()
     t0 = time.monotonic()
@@ -363,6 +454,31 @@ async def fetch_token_transfers_chunked(
         latest_block = await fetch_latest_block_number()
     start, end = _recent_block_range(latest_block)
     return await _fetch_chunked(address, "tokentx", start, end, MAX_CHUNKS, "Token transfers")
+
+
+async def fetch_transaction_count(address: str) -> int:
+    """
+    Fetches the total number of outgoing transactions (nonce) for the address.
+    This provides a 'Total Transactions' count that is independent of the
+    display limit used for the transaction list.
+    """
+    params = {
+        "chainid": CHAIN_ID_ETHEREUM,
+        "module": "proxy",
+        "action": "eth_getTransactionCount",
+        "address": address,
+        "tag": "latest",
+    }
+    pool = get_etherscan_pool()
+    try:
+        data = await pool.fetch(ETHERSCAN_URL, params)
+        result = data.get("result")
+        if result:
+            return int(result, 16)
+        return 0
+    except Exception as e:
+        logger.error(f"[ethereum] fetch_transaction_count error for {address}: {e}")
+        return 0
 
 
 # ---------------------------------------------------------------------------
@@ -690,6 +806,10 @@ async def _process_bfs_node(
     end_block: int,
     tx_limit: int,
     depth: int = 0,
+    seed_normal: Optional[List[Dict[str, Any]]] = None,
+    seed_internal: Optional[List[Dict[str, Any]]] = None,
+    seed_token: Optional[List[Dict[str, Any]]] = None,
+    page: int = 1,
 ) -> Tuple[List[Dict[str, Any]], List[str]]:
     """
     Fetch and collect edge types for one BFS node.
@@ -712,17 +832,21 @@ async def _process_bfs_node(
     chunks = _make_block_chunks(start_block, end_block, BFS_CHUNK_COUNT)
 
     if depth == 0:
-        # Seed wallet: fetch all 3 types with full-history fallback.
-        # If recent window returns 0 (older/inactive wallet), retries from block 0.
-        raw_normal, raw_internal, raw_token = await asyncio.gather(
-            _fetch_with_fallback(address, "txlist", start_block, end_block, BFS_CHUNK_COUNT, "BFS normal"),
-            _fetch_with_fallback(address, "txlistinternal", start_block, end_block, BFS_CHUNK_COUNT, "BFS internal"),
-            _fetch_with_fallback(address, "tokentx", start_block, end_block, BFS_CHUNK_COUNT, "BFS token"),
-            return_exceptions=True,
-        )
+        if seed_normal is not None and seed_internal is not None and seed_token is not None:
+            raw_normal, raw_internal, raw_token = seed_normal, seed_internal, seed_token
+        else:
+            # Seed wallet: fetch a reasonable number of recent transactions to build a graph
+            # 100 is enough for a dashboard view without causing timeouts.
+            raw_normal, raw_internal, raw_token = await asyncio.gather(
+                _fetch_paged(address, "txlist", 100),
+                _fetch_paged(address, "txlistinternal", 100),
+                _fetch_paged(address, "tokentx", 100),
+                return_exceptions=True,
+            )
     else:
-        # Counterparty wallet: only txlist, recent window only (speed priority)
-        raw_normal = await _fetch_chunked(address, "txlist", start_block, end_block, BFS_CHUNK_COUNT, "BFS hop txlist")
+        # Counterparty wallet: use paged fetcher with strict limit (speed priority)
+        # We only need a few connections to build the graph layer.
+        raw_normal = await _fetch_paged(address, "txlist", limit=tx_limit)
         raw_internal = []
         raw_token = []
 
@@ -776,6 +900,10 @@ async def bfs_wallet_hops(
     tx_limit: int = 10,
     min_eth_value: float = MIN_ETH_VALUE,
     latest_block: Optional[int] = None,
+    seed_normal: Optional[List[Dict[str, Any]]] = None,
+    seed_internal: Optional[List[Dict[str, Any]]] = None,
+    seed_token: Optional[List[Dict[str, Any]]] = None,
+    page: int = 1,
 ) -> List[Dict[str, Any]]:
     """
     BFS traversal over wallet connections -- parallel depth-layer expansion.
@@ -832,8 +960,11 @@ async def bfs_wallet_hops(
         async def _timed_node(addr: str, depth: int):
             timeout_val = BFS_NODE_TIMEOUT if depth > 0 else 30.0
             try:
+                sn = seed_normal if depth == 0 else None
+                si = seed_internal if depth == 0 else None
+                st = seed_token if depth == 0 else None
                 return await asyncio.wait_for(
-                    _process_bfs_node(addr, start_block, end_block, tx_limit, depth),
+                    _process_bfs_node(addr, start_block, end_block, tx_limit, depth, sn, si, st, page=page),
                     timeout=timeout_val,
                 )
             except asyncio.TimeoutError:
@@ -947,9 +1078,30 @@ def build_graph(
 # Main wallet analysis -- all tasks in one asyncio.gather
 # ---------------------------------------------------------------------------
 
+async def analyze_wallet(
+    address: str,
+    hops: int = 1,
+    tx_limit: int = 50,
+    page: int = 1,
+) -> Dict[str, Any]:
+    """
+    Orchestrates the analysis of an Ethereum wallet.
+    Returns: {
+        wallet, balance, transaction_count,
+        transactions: [],
+        graph: { nodes, edges },
+        ...
+    }
+    """
+    return await ethereum_wallet_info(address, hops, tx_limit, page)
+
+
 async def ethereum_wallet_info(
-    address: str, hops: int = 1, tx_limit: int = 10
-) -> dict:
+    address: str,
+    hops: int = 0,
+    tx_limit: int = 50,
+    page: int = 1,
+) -> Dict[str, Any]:
     """
     Orchestrates a full wallet analysis -- optimized for <5s response.
 
@@ -962,7 +1114,59 @@ async def ethereum_wallet_info(
     """
     address = address.lower()
     total_t0 = time.monotonic()
-    logger.info(f"[ethereum] === Analysis start: {address} hops={hops} limit={tx_limit} ===")
+    logger.info(f"[ethereum] === Analysis start: {address} hops={hops} limit={tx_limit} page={page} ===")
+
+    # Step 0: Fast-path for hops=0 (Quick Analysis)
+    if hops == 0:
+        logger.info(f"[ethereum] hops=0 — fast-path: quick analysis")
+        # For quick analysis, we fetch balance, count, AND txs up to tx_limit
+        # to compute risk score and connected wallets.
+        fetch_limit = max(tx_limit, 50)
+        balance, is_contract, total_tx_count, outgoing_count, top_txs = await asyncio.gather(
+            fetch_balance(address),
+            is_smart_contract(address),
+            _fetch_total_count(address, "txlist"),
+            fetch_transaction_count(address),
+            _fetch_paged(address, "txlist", limit=fetch_limit, page=page),
+            return_exceptions=True,
+        )
+        def _safe(val, default):
+            return val if not isinstance(val, Exception) else default
+            
+        bal_val = float(_safe(balance, 0.0))
+        isc_val = bool(_safe(is_contract, False))
+        txs_val = _safe(top_txs, [])
+        total_val = _safe(total_tx_count, 0)
+        out_val = _safe(outgoing_count, 0)
+        in_val = max(0, total_val - out_val)
+
+        # Compute quick risk and connected count
+        risk_score, risk_flags = compute_risk_score([], address, isc_val) # No BFS edges yet
+        unique_connected = len(set(
+            (t.get("from") or "").lower() for t in txs_val if (t.get("from") or "").lower() != address
+        ) | set(
+            (t.get("to") or "").lower() for t in txs_val if (t.get("to") or "").lower() != address
+        ))
+
+        return {
+            "wallet": address,
+            "currency": "ETH",
+            "balance": bal_val,
+            "is_smart_contract": isc_val,
+            "transaction_count": total_val,
+            "incoming_count": in_val,
+            "outgoing_count": out_val,
+            "internal_transaction_count": 0,
+            "token_transaction_count": 0,
+            "hops": 0,
+            "tx_limit": int(tx_limit),
+            "page": int(page),
+            "transactions": txs_val[:tx_limit], # Return the first N as requested
+            "graph": {"nodes": [], "edges": []},
+            "risk_score": risk_score,
+            "risk_flags": risk_flags,
+            "connected_wallets_count": unique_connected,
+        }
 
     # Step 1: Fetch latest block once -- shared across ALL subsequent calls
     latest_block = await fetch_latest_block_number()
@@ -972,23 +1176,25 @@ async def ethereum_wallet_info(
         f"({end_block - start_block:,} blocks = last {RECENT_BLOCKS_WINDOW:,} blocks)"
     )
 
-    # Step 2: Fire ALL independent tasks concurrently in one gather
-    # _fetch_with_fallback: tries recent window first; falls back to block 0
-    # if no results found -- fixes older/inactive wallets transparently.
+    # Step 2: Fire primary tasks concurrently.
+    # We use _fetch_paged here instead of _fetch_with_fallback because:
+    # 1. It respects the tx_limit requested by the user.
+    # 2. It's significantly faster for high-volume wallets (no pagination splits).
+    # 3. Dashboard users typically only care about recent transactions.
     (
         balance,
         is_contract,
+        total_tx_count,
         raw_txs,
         internal_txs,
         token_txs,
-        bfs_edges,
     ) = await asyncio.gather(
         fetch_balance(address),
         is_smart_contract(address),
-        _fetch_with_fallback(address, "txlist", start_block, end_block, MAX_CHUNKS, "Normal txs"),
-        _fetch_with_fallback(address, "txlistinternal", start_block, end_block, MAX_CHUNKS, "Internal txs"),
-        _fetch_with_fallback(address, "tokentx", start_block, end_block, MAX_CHUNKS, "Token transfers"),
-        bfs_wallet_hops(address, hops, tx_limit, latest_block=latest_block),
+        fetch_transaction_count(address),
+        _fetch_paged(address, "txlist", limit=tx_limit, page=page),
+        _fetch_paged(address, "txlistinternal", limit=tx_limit, page=page),
+        _fetch_paged(address, "tokentx", limit=tx_limit, page=page),
         return_exceptions=True,
     )
 
@@ -1000,10 +1206,33 @@ async def ethereum_wallet_info(
 
     balance = _safe(balance, 0.0)
     is_contract = _safe(is_contract, False)
+    total_tx_count = _safe(total_tx_count, 0)
     raw_txs = _safe(raw_txs, [])
     internal_txs = _safe(internal_txs, [])
     token_txs = _safe(token_txs, [])
-    bfs_edges = _safe(bfs_edges, [])
+
+    # Calculate true total incoming/outgoing counts via fast linear scan
+    # total_outgoing = Nonce (exact for EOA)
+    # total_incoming = Scanned from history
+    total_inc, total_out = await asyncio.gather(
+        _fetch_total_count(address, "txlist"),  # This gets all, we need to filter later or just use as total
+        fetch_transaction_count(address),       # Nonce
+        return_exceptions=True
+    )
+    total_inc = _safe(total_inc, 0)
+    total_out = _safe(total_out, 0)
+    
+    # Step 3: Run BFS traversal using the already-fetched seed data.
+    bfs_edges = await bfs_wallet_hops(
+        address,
+        hops,
+        tx_limit,
+        latest_block=latest_block,
+        seed_normal=raw_txs,
+        seed_internal=internal_txs,
+        seed_token=token_txs,
+        page=page,
+    )
 
     total_elapsed = time.monotonic() - total_t0
     logger.info(
@@ -1059,6 +1288,49 @@ async def ethereum_wallet_info(
     # Step 6: Build graph structure
     graph = build_graph(formatted, address)
 
+    # Step 7: Combine seed transactions for the table explorer
+    def _to_eth(wei_str):
+        try:
+            return str(float(wei_str or 0) / 1e18)
+        except:
+            return "0"
+
+    seed_explorer_txs = []
+    
+    # Add normal txs
+    for tx in raw_txs:
+        tx_copy = dict(tx)
+        tx_copy["type"] = "normal"
+        tx_copy["value"] = _to_eth(tx.get("value"))
+        # Convert unix timestamp to ISO string for frontend parsing
+        ts = tx.get("timeStamp")
+        if ts:
+            tx_copy["time"] = datetime.fromtimestamp(int(ts)).isoformat()
+        seed_explorer_txs.append(tx_copy)
+        
+    # Add internal txs
+    for tx in internal_txs:
+        tx_copy = dict(tx)
+        tx_copy["type"] = "internal"
+        tx_copy["value"] = _to_eth(tx.get("value"))
+        ts = tx.get("timeStamp")
+        if ts:
+            tx_copy["time"] = datetime.fromtimestamp(int(ts)).isoformat()
+        seed_explorer_txs.append(tx_copy)
+        
+    # Add token txs
+    for tx in token_txs:
+        tx_copy = dict(tx)
+        tx_copy["type"] = "token"
+        tx_copy["value"] = _to_eth(tx.get("value")) 
+        ts = tx.get("timeStamp")
+        if ts:
+            tx_copy["time"] = datetime.fromtimestamp(int(ts)).isoformat()
+        seed_explorer_txs.append(tx_copy)
+        
+    # Sort by time descending
+    seed_explorer_txs.sort(key=lambda x: int(x.get("timeStamp", 0)), reverse=True)
+
     final_elapsed = time.monotonic() - total_t0
     logger.info(f"[ethereum] === Total wall-clock time: {final_elapsed:.2f}s ===")
 
@@ -1067,12 +1339,15 @@ async def ethereum_wallet_info(
         "currency": "ETH",
         "balance": float(balance),
         "is_smart_contract": bool(is_contract),
-        "transaction_count": len(raw_txs),
+        "transaction_count": total_inc, # Total txs (approx)
+        "incoming_count": total_inc - total_out if total_inc > total_out else 0,
+        "outgoing_count": total_out,
         "internal_transaction_count": len(internal_txs),
         "token_transaction_count": len(token_txs),
         "hops": int(hops),
         "tx_limit": int(tx_limit),
-        "transactions": formatted,
+        "page": int(page),
+        "transactions": seed_explorer_txs[:tx_limit],
         "graph": graph,
         "risk_score": risk_score,
         "risk_flags": risk_flags,

@@ -4,11 +4,16 @@ import Navbar from './components/Navbar'
 import Dashboard from './components/Dashboard'
 import GraphVisualization from './components/GraphVisualization'
 import LandingPage from './components/LandingPage'
-import Login from './components/Login'
-import { api, ApiError, getAuthToken, clearAuthToken } from './services/api'
+import { api, ApiError } from './services/api'
 
 function App() {
   const [activeView, setActiveView] = useState('landing')
+  const [dashboardSection, setDashboardSection] = useState('dashboard')
+  const [theme, setTheme] = useState(() => {
+    const savedTheme = window.localStorage.getItem('chakra-theme')
+    if (savedTheme === 'light' || savedTheme === 'dark') return savedTheme
+    return 'dark'
+  })
   const [path, setPath] = useState(window.location.pathname || '/')
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false)
   const [address, setAddress] = useState('')
@@ -18,20 +23,12 @@ function App() {
   const [data, setData] = useState(null)
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState(null)
-  const [token, setToken] = useState(null)
 
   const navigate = (nextPath) => {
     if (nextPath === path) return
     window.history.pushState({}, '', nextPath)
     setPath(nextPath)
   }
-
-  useEffect(() => {
-    const existingToken = getAuthToken()
-    if (existingToken) {
-      setToken(existingToken)
-    }
-  }, [])
 
   useEffect(() => {
     const handlePopstate = () => {
@@ -51,16 +48,12 @@ function App() {
     }
   }, [path])
 
-  // Route guard: protect dashboard/graph, redirect login appropriately
   useEffect(() => {
-    if (!token && (path === '/dashboard' || path === '/graph')) {
-      navigate('/login')
-    } else if (token && path === '/login') {
-      navigate('/dashboard')
-    }
-  }, [token, path])
+    document.documentElement.setAttribute('data-theme', theme)
+    window.localStorage.setItem('chakra-theme', theme)
+  }, [theme])
 
-  const fetchWallet = async () => {
+  const fetchWallet = async (isQuick = false, page = 1) => {
     if (!address || !address.trim()) {
       setError('Please enter a valid wallet address')
       return
@@ -68,9 +61,10 @@ function App() {
 
     setLoading(true)
     setError(null)
+    const effectiveHops = isQuick ? 0 : hops
 
     try {
-      const result = await api.fetchWalletDashboard(address.trim(), hops, limit)
+      const result = await api.fetchWalletDashboard(address.trim(), effectiveHops, limit, page)
       // Debug: inspect full API payload including graph.nodes / graph.edges
       // to verify the backend is returning the expected structure.
       console.log('[App] API RESPONSE:', result)
@@ -93,23 +87,10 @@ function App() {
 
   const renderContent = () => {
     // PUBLIC ROUTES
-    if (path === '/login') {
-      return (
-        <Login
-          onLoginSuccess={(newToken) => {
-            setToken(newToken)
-            navigate('/dashboard')
-          }}
-        />
-      )
-    }
-
     if (path === '/dashboard') {
-      if (!token) {
-        return null
-      }
       return (
         <Dashboard
+          activeSection={dashboardSection}
           address={address}
           setAddress={setAddress}
           hops={hops}
@@ -119,7 +100,8 @@ function App() {
           data={data}
           loading={loading}
           error={error}
-          onScan={fetchWallet}
+          onScan={(isQuick) => fetchWallet(isQuick, 1)}
+          onPageChange={(page) => fetchWallet(false, page)}
           onGraph={() => navigate('/graph')}
           onClearError={() => setError(null)}
         />
@@ -127,9 +109,6 @@ function App() {
     }
 
     if (path === '/graph') {
-      if (!token) {
-        return null
-      }
       return (
         <GraphVisualization
           data={data}
@@ -142,26 +121,22 @@ function App() {
     return (
       <LandingPage
         onEnterDashboard={() => {
-          if (token) {
-            navigate('/dashboard')
-          } else {
-            navigate('/login')
-          }
+          navigate('/dashboard')
         }}
       />
     )
   }
 
-  const showShell = token && (path === '/dashboard' || path === '/graph')
+  const showShell = path === '/dashboard' || path === '/graph'
 
   return (
     <div className="min-h-screen bg-background flex" data-testid="app-container">
       {showShell && (
         <Sidebar
-          activeView={activeView === 'graph' ? 'dashboard' : activeView}
+          activeView={dashboardSection}
           setActiveView={(id) => {
-            if (!token) return
-            if (id === 'dashboard' || id === 'wallet-analysis' || id === 'transaction-explorer' || id === 'risk-monitor') {
+            setDashboardSection(id)
+            if (id === 'dashboard' || id === 'wallet-analysis' || id === 'transaction-explorer' || id === 'risk-monitor' || id === 'settings') {
               navigate('/dashboard')
             } else {
               navigate('/dashboard')
@@ -181,10 +156,10 @@ function App() {
             setAddress={setAddress}
             network={network}
             setNetwork={setNetwork}
-            onSearch={fetchWallet}
+            onSearch={(isQuick) => fetchWallet(isQuick)}
+            theme={theme}
+            onToggleTheme={() => setTheme((prev) => (prev === 'dark' ? 'light' : 'dark'))}
             onLogout={() => {
-              clearAuthToken()
-              setToken(null)
               setData(null)
               setError(null)
               navigate('/')
