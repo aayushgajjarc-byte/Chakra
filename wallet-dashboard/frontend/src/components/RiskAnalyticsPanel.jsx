@@ -3,6 +3,8 @@ import { PieChart, Pie, Cell, ResponsiveContainer } from 'recharts'
 import { AlertTriangle, Users, Shield } from 'lucide-react'
 import { useMemo } from 'react'
 import { Skeleton } from './ui/Skeleton'
+import { formatAddress, formatHash } from '../utils/format'
+import CopyButton from './ui/CopyButton'
 
 export default function RiskAnalyticsPanel({ data, loading }) {
   // Calculate all analytics from real transaction data
@@ -90,7 +92,8 @@ export default function RiskAnalyticsPanel({ data, loading }) {
       .sort((a, b) => b[1].totalValue - a[1].totalValue)
       .slice(0, 3)
       .map(([address, info]) => ({
-        address: address.slice(0, 10) + '...' + address.slice(-4),
+        address: formatAddress(address),
+        fullAddress: address,
         risk: info.totalValue > 20 ? 'HIGH' : 'MEDIUM',
         transactions: info.count,
       }))
@@ -110,7 +113,8 @@ export default function RiskAnalyticsPanel({ data, loading }) {
       })
       .slice(0, 2)
       .map((tx) => ({
-        hash: tx.hash ? tx.hash.slice(0, 10) + '...' + tx.hash.slice(-4) : 'Unknown',
+        hash: formatHash(tx.hash),
+        fullHash: tx.hash,
         reason:
           parseFloat(tx.value || 0) > 50
             ? 'Extremely large transfer'
@@ -232,9 +236,14 @@ export default function RiskAnalyticsPanel({ data, loading }) {
                   className="flex items-center justify-between p-3 bg-hover rounded-lg border border-border hover:border-primary/30 transition-colors"
                   data-testid={`counterparty-${index}`}
                 >
-                  <div>
-                    <div className="font-mono text-sm text-textPrimary">{party.address}</div>
-                    <div className="text-xs text-textSecondary">{party.transactions} transactions</div>
+                  <div className="flex items-center group">
+                    <div>
+                      <div className="font-mono text-sm text-textPrimary" title={party.fullAddress}>{party.address}</div>
+                      <div className="text-xs text-textSecondary">{party.transactions} transactions</div>
+                    </div>
+                    {party.fullAddress && (
+                      <CopyButton value={party.fullAddress} className="ml-2 group-hover:opacity-100 opacity-0 focus:opacity-100" />
+                    )}
                   </div>
                   <span
                     className={`px-2 py-1 text-xs font-semibold rounded-full ${
@@ -266,9 +275,14 @@ export default function RiskAnalyticsPanel({ data, loading }) {
                   data-testid={`suspicious-tx-${index}`}
                 >
                   <AlertTriangle size={16} className="text-warning mr-3" />
-                  <div>
-                    <div className="font-mono text-sm text-textPrimary">{tx.hash}</div>
-                    <div className="text-xs text-textSecondary">{tx.reason}</div>
+                  <div className="flex items-center group flex-1">
+                    <div className="flex-1">
+                      <div className="font-mono text-sm text-textPrimary" title={tx.fullHash}>{tx.hash}</div>
+                      <div className="text-xs text-textSecondary">{tx.reason}</div>
+                    </div>
+                    {tx.fullHash && (
+                      <CopyButton value={tx.fullHash} className="ml-2 group-hover:opacity-100 opacity-0 focus:opacity-100" />
+                    )}
                   </div>
                 </div>
               ))}

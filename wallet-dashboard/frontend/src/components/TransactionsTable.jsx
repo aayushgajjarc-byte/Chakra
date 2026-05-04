@@ -1,6 +1,8 @@
 import { useState, useMemo } from 'react'
-import { ArrowUpDown, Search, Filter } from 'lucide-react'
+import { ArrowUpDown, Search, Filter, Copy, Check } from 'lucide-react'
 import { TableSkeleton } from './ui/Skeleton'
+import { formatAddress, formatHash } from '../utils/format'
+import CopyButton from './ui/CopyButton'
 
 export default function TransactionsTable({ 
   transactions, 
@@ -9,7 +11,9 @@ export default function TransactionsTable({
   totalCount = 0, 
   onPageChange, 
   currentPage = 1,
-  pageSize = 10
+  pageSize = 10,
+  deepDiveInProgress = false,
+  deepDiveReady = true,
 }) {
   const [sortField, setSortField] = useState('time')
   const [sortDirection, setSortDirection] = useState('desc')
@@ -113,17 +117,26 @@ export default function TransactionsTable({
                   key={tx.hash ? `${tx.hash}-${index}` : `row-${index}`}
                   className="hover:bg-background/50 transition-all duration-200"
                 >
-                  <td className="px-6 py-4 whitespace-nowrap text-sm font-mono text-primary">
-                    {tx.hash ? `${tx.hash.slice(0, 10)}...` : '—'}
+                  <td className="px-6 py-4 whitespace-nowrap text-sm font-mono text-primary group">
+                    <div className="flex items-center">
+                      <span title={tx.hash}>{formatHash(tx.hash)}</span>
+                      {tx.hash && <CopyButton value={tx.hash} className="ml-2 group-hover:opacity-100 opacity-0 focus:opacity-100" />}
+                    </div>
                   </td>
-                  <td className="px-6 py-4 whitespace-nowrap text-sm font-mono text-textPrimary">
-                    {tx.from ? `${tx.from.slice(0, 10)}...` : '—'}
+                  <td className="px-6 py-4 whitespace-nowrap text-sm font-mono text-textPrimary group">
+                    <div className="flex items-center">
+                      <span title={tx.from}>{formatAddress(tx.from)}</span>
+                      {tx.from && <CopyButton value={tx.from} className="ml-2 group-hover:opacity-100 opacity-0 focus:opacity-100" />}
+                    </div>
                   </td>
-                  <td className="px-6 py-4 whitespace-nowrap text-sm font-mono text-textPrimary">
-                    {tx.to ? `${tx.to.slice(0, 10)}...` : '—'}
+                  <td className="px-6 py-4 whitespace-nowrap text-sm font-mono text-textPrimary group">
+                    <div className="flex items-center">
+                      <span title={tx.to}>{formatAddress(tx.to)}</span>
+                      {tx.to && <CopyButton value={tx.to} className="ml-2 group-hover:opacity-100 opacity-0 focus:opacity-100" />}
+                    </div>
                   </td>
                   <td className="px-6 py-4 whitespace-nowrap text-sm text-textPrimary">
-                    {parseFloat(tx.value || 0).toFixed(4)} {currency}
+                    {parseFloat(tx.value || 0).toFixed(4)} {tx.tokenSymbol || currency}
                   </td>
                   <td className="px-6 py-4 whitespace-nowrap text-sm text-textSecondary">
                     {tx.time ? new Date(tx.time).toLocaleString() : '—'}
@@ -161,14 +174,14 @@ export default function TransactionsTable({
 
           <button
             onClick={() => onPageChange(currentPage + 1)}
-            disabled={currentPage >= totalPages}
+            disabled={currentPage >= totalPages || !deepDiveReady || (deepDiveInProgress && currentPage === 1)}
             className="px-3 py-1 border border-border rounded text-textSecondary hover:bg-border disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
           >
             Next
           </button>
         </div>
         <div className="text-xs text-muted uppercase tracking-widest">
-          Live Blockchain Paging
+          {deepDiveReady ? 'MongoDB Transaction Paging' : 'Deep Dive Syncing... Page 1 Available'}
         </div>
       </div>
     </div>

@@ -132,6 +132,16 @@ def _fmt_value_eth(v: Any) -> str:
         return str(v)
 
 
+def _normalize_table_tx(tx: Dict[str, Any]) -> Dict[str, Any]:
+    """Normalize a tx record for frontend table display."""
+    out = dict(tx or {})
+    out["value"] = _fmt_value_eth(out.get("value", "0"))
+    ts = out.get("timeStamp")
+    if ts and not out.get("time"):
+        out["time"] = _fmt_time(ts)
+    return out
+
+
 # ---------------------------------------------------------------------------
 # Phase 1 -- Latest block
 # ---------------------------------------------------------------------------
@@ -1017,54 +1027,95 @@ async def bfs_wallet_hops(
 # Graph builder -- converts BFS edge list -> ReactFlow-compatible graph
 # ---------------------------------------------------------------------------
 
+def _count_plain_eth_peers(
+    graph_edges: List[Dict[str, Any]],
+    wallet_address: str,
+    contract_map: Dict[str, bool],
+) -> int:
+    """
+    Unique counterparties that share a plain-ETH hop with the wallet (graph parity).
+    Excludes the wallet itself and excludes smart-contract addresses.
+    """
+    w = wallet_address.lower()
+    peers: Set[str] = set()
+    for e in graph_edges:
+        for key in ("from", "to"):
+            a = (e.get(key) or "").lower()
+            if not a or a == w:
+                continue
+            if contract_map.get(a):
+                continue
+            peers.add(a)
+    return len(peers)
+
+
+def _txlist_is_plain_eth_transfer(tx: Dict[str, Any]) -> bool:
+    """Etherscan txlist row: simple ETH move (no contract call payload)."""
+    inp = tx.get("input", "0x")
+    if inp is None:
+        return True
+    s = str(inp).strip().lower()
+    return s in ("0x", "0x0", "")
+
+
 def build_graph(
     transactions: List[Dict[str, Any]],
     wallet_address: str,
+    contract_map: Optional[Dict[str, bool]] = None,
 ) -> Dict[str, Any]:
     """
     Convert the flat BFS edge list into a {nodes, edges} graph structure
     compatible with the frontend ReactFlow renderer.
+
+    Expects only plain-ETH txlist hops (type \"eth\"): no contract calls,
+    no smart-contract counterparties (except the analyzed wallet may be a contract).
     """
-    seen_nodes: Set[str] = set()
-    nodes: List[Dict[str, Any]] = []
+    contract_map = contract_map or {}
+    center = wallet_address.lower()
+
+    def _is_contract(addr: str) -> bool:
+        return bool(contract_map.get((addr or "").lower(), False))
+
     edges: List[Dict[str, Any]] = []
-
-    for tx in transactions:
-        for addr_key in ("from", "to"):
-            addr = (tx.get(addr_key) or "").lower()
-            if addr and addr not in seen_nodes:
-                seen_nodes.add(addr)
-                nodes.append(
-                    {
-                        "id": addr,
-                        "address": addr,
-                        "is_contract": tx.get("is_contract", False),
-                        "type": (
-                            "contract"
-                            if tx.get("is_contract", False)
-                            else "normal"
-                        ),
-                        "is_center": addr == wallet_address.lower(),
-                    }
-                )
-
     for i, tx in enumerate(transactions):
         from_addr = (tx.get("from") or "").lower()
         to_addr = (tx.get("to") or "").lower() if tx.get("to") else None
         if not from_addr or not to_addr:
             continue
+        if from_addr != center and _is_contract(from_addr):
+            continue
+        if to_addr != center and _is_contract(to_addr):
+            continue
         edge_id = tx.get("hash") or f"edge-{i}"
         edges.append(
             {
-                "id": edge_id,
+                "id": f"{edge_id}-{from_addr}-{to_addr}-{i}",
                 "from": from_addr,
                 "to": to_addr,
                 "value": tx.get("value", "0"),
-                "type": tx.get("type", "eth"),
+                "type": "eth",
                 "hash": tx.get("hash", ""),
                 "time": tx.get("time", ""),
-                "token_symbol": tx.get("token_symbol"),
-                "token_contract": tx.get("token_contract"),
+            }
+        )
+
+    addrs: Set[str] = {center}
+    for e in edges:
+        addrs.add(e["from"])
+        addrs.add(e["to"])
+
+    nodes: List[Dict[str, Any]] = []
+    for addr in sorted(addrs):
+        if not addr:
+            continue
+        is_center = addr == center
+        nodes.append(
+            {
+                "id": addr,
+                "address": addr,
+                "is_contract": False,
+                "type": "normal",
+                "is_center": is_center,
             }
         )
 
@@ -1122,11 +1173,10 @@ async def ethereum_wallet_info(
         # For quick analysis, we fetch balance, count, AND txs up to tx_limit
         # to compute risk score and connected wallets.
         fetch_limit = max(tx_limit, 50)
-        balance, is_contract, total_tx_count, outgoing_count, top_txs = await asyncio.gather(
+        balance, is_contract, total_tx_count, top_txs = await asyncio.gather(
             fetch_balance(address),
             is_smart_contract(address),
             _fetch_total_count(address, "txlist"),
-            fetch_transaction_count(address),
             _fetch_paged(address, "txlist", limit=fetch_limit, page=page),
             return_exceptions=True,
         )
@@ -1137,16 +1187,22 @@ async def ethereum_wallet_info(
         isc_val = bool(_safe(is_contract, False))
         txs_val = _safe(top_txs, [])
         total_val = _safe(total_tx_count, 0)
-        out_val = _safe(outgoing_count, 0)
-        in_val = max(0, total_val - out_val)
 
-        # Compute quick risk and connected count
+        # Compute quick risk and connected count (plain ETH peers only — matches graph semantics)
         risk_score, risk_flags = compute_risk_score([], address, isc_val) # No BFS edges yet
-        unique_connected = len(set(
-            (t.get("from") or "").lower() for t in txs_val if (t.get("from") or "").lower() != address
-        ) | set(
-            (t.get("to") or "").lower() for t in txs_val if (t.get("to") or "").lower() != address
-        ))
+        plain_txs = [t for t in txs_val if _txlist_is_plain_eth_transfer(t)]
+        peer_addrs: Set[str] = set()
+        for t in plain_txs:
+            fa = (t.get("from") or "").lower()
+            ta = (t.get("to") or "").lower()
+            if fa and fa != address:
+                peer_addrs.add(fa)
+            if ta and ta != address:
+                peer_addrs.add(ta)
+        unique_connected = 0
+        if peer_addrs:
+            cm_quick = await batch_is_contract(list(peer_addrs))
+            unique_connected = len([a for a in peer_addrs if not cm_quick.get(a, False)])
 
         return {
             "wallet": address,
@@ -1154,14 +1210,14 @@ async def ethereum_wallet_info(
             "balance": bal_val,
             "is_smart_contract": isc_val,
             "transaction_count": total_val,
-            "incoming_count": in_val,
-            "outgoing_count": out_val,
+            "incoming_count": None,
+            "outgoing_count": None,
             "internal_transaction_count": 0,
             "token_transaction_count": 0,
             "hops": 0,
             "tx_limit": int(tx_limit),
             "page": int(page),
-            "transactions": txs_val[:tx_limit], # Return the first N as requested
+            "transactions": [_normalize_table_tx(t) for t in txs_val[:tx_limit]], # Return the first N as requested
             "graph": {"nodes": [], "edges": []},
             "risk_score": risk_score,
             "risk_flags": risk_flags,
@@ -1184,14 +1240,14 @@ async def ethereum_wallet_info(
     (
         balance,
         is_contract,
-        total_tx_count,
+        total_inc,
         raw_txs,
         internal_txs,
         token_txs,
     ) = await asyncio.gather(
         fetch_balance(address),
         is_smart_contract(address),
-        fetch_transaction_count(address),
+        _fetch_total_count(address, "txlist"),
         _fetch_paged(address, "txlist", limit=tx_limit, page=page),
         _fetch_paged(address, "txlistinternal", limit=tx_limit, page=page),
         _fetch_paged(address, "tokentx", limit=tx_limit, page=page),
@@ -1206,21 +1262,10 @@ async def ethereum_wallet_info(
 
     balance = _safe(balance, 0.0)
     is_contract = _safe(is_contract, False)
-    total_tx_count = _safe(total_tx_count, 0)
+    total_inc = _safe(total_inc, 0)
     raw_txs = _safe(raw_txs, [])
     internal_txs = _safe(internal_txs, [])
     token_txs = _safe(token_txs, [])
-
-    # Calculate true total incoming/outgoing counts via fast linear scan
-    # total_outgoing = Nonce (exact for EOA)
-    # total_incoming = Scanned from history
-    total_inc, total_out = await asyncio.gather(
-        _fetch_total_count(address, "txlist"),  # This gets all, we need to filter later or just use as total
-        fetch_transaction_count(address),       # Nonce
-        return_exceptions=True
-    )
-    total_inc = _safe(total_inc, 0)
-    total_out = _safe(total_out, 0)
     
     # Step 3: Run BFS traversal using the already-fetched seed data.
     bfs_edges = await bfs_wallet_hops(
@@ -1285,8 +1330,9 @@ async def ethereum_wallet_info(
             }
         )
 
-    # Step 6: Build graph structure
-    graph = build_graph(formatted, address)
+    # Step 6: Graph = plain ETH txlist hops only (same class as non–contract-call rows)
+    graph_edges = [e for e in formatted if e.get("type") == "eth"]
+    graph = build_graph(graph_edges, address, contract_map)
 
     # Step 7: Combine seed transactions for the table explorer
     def _to_eth(wei_str):
@@ -1302,27 +1348,6 @@ async def ethereum_wallet_info(
         tx_copy = dict(tx)
         tx_copy["type"] = "normal"
         tx_copy["value"] = _to_eth(tx.get("value"))
-        # Convert unix timestamp to ISO string for frontend parsing
-        ts = tx.get("timeStamp")
-        if ts:
-            tx_copy["time"] = datetime.fromtimestamp(int(ts)).isoformat()
-        seed_explorer_txs.append(tx_copy)
-        
-    # Add internal txs
-    for tx in internal_txs:
-        tx_copy = dict(tx)
-        tx_copy["type"] = "internal"
-        tx_copy["value"] = _to_eth(tx.get("value"))
-        ts = tx.get("timeStamp")
-        if ts:
-            tx_copy["time"] = datetime.fromtimestamp(int(ts)).isoformat()
-        seed_explorer_txs.append(tx_copy)
-        
-    # Add token txs
-    for tx in token_txs:
-        tx_copy = dict(tx)
-        tx_copy["type"] = "token"
-        tx_copy["value"] = _to_eth(tx.get("value")) 
         ts = tx.get("timeStamp")
         if ts:
             tx_copy["time"] = datetime.fromtimestamp(int(ts)).isoformat()
@@ -1334,14 +1359,18 @@ async def ethereum_wallet_info(
     final_elapsed = time.monotonic() - total_t0
     logger.info(f"[ethereum] === Total wall-clock time: {final_elapsed:.2f}s ===")
 
+    # Counterparties from plain-ETH graph edges only (not internal / token / contract-call hops)
+    connected_wallets_count = _count_plain_eth_peers(graph_edges, address, contract_map)
+
     return {
         "wallet": address,
         "currency": "ETH",
         "balance": float(balance),
         "is_smart_contract": bool(is_contract),
-        "transaction_count": total_inc, # Total txs (approx)
-        "incoming_count": total_inc - total_out if total_inc > total_out else 0,
-        "outgoing_count": total_out,
+        # Totals / in-out match Mongo archive after /api/wallet/analyze hydrates it
+        "transaction_count": total_inc,
+        "incoming_count": None,
+        "outgoing_count": None,
         "internal_transaction_count": len(internal_txs),
         "token_transaction_count": len(token_txs),
         "hops": int(hops),
@@ -1351,4 +1380,5 @@ async def ethereum_wallet_info(
         "graph": graph,
         "risk_score": risk_score,
         "risk_flags": risk_flags,
+        "connected_wallets_count": connected_wallets_count,
     }

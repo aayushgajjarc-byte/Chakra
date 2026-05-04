@@ -21,6 +21,7 @@ function App() {
   const [hops, setHops] = useState(1)
   const [limit, setLimit] = useState(10)
   const [data, setData] = useState(null)
+  const [analysisMode, setAnalysisMode] = useState(null) // 'quick' | 'deep' | null
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState(null)
 
@@ -34,9 +35,34 @@ function App() {
     const handlePopstate = () => {
       setPath(window.location.pathname || '/')
     }
+    
+    const handleSearch = (event) => {
+      const { address } = event.detail
+      if (address) {
+        setAddress(address)
+        // We use setTimeout to ensure setAddress has updated before calling fetchWallet
+        // or we can pass address directly to fetchWallet
+      }
+    }
+
     window.addEventListener('popstate', handlePopstate)
-    return () => window.removeEventListener('popstate', handlePopstate)
+    window.addEventListener('chakra-search', handleSearch)
+    
+    return () => {
+      window.removeEventListener('popstate', handlePopstate)
+      window.removeEventListener('chakra-search', handleSearch)
+    }
   }, [])
+
+  // Auto-search when address is updated from a history click
+  useEffect(() => {
+    if (address && activeView === 'dashboard') {
+      // Check if this was a history click by verifying if the address is not already analyzed
+      if (data?.wallet !== address.toLowerCase()) {
+        fetchWallet(true, 1)
+      }
+    }
+  }, [address])
 
   useEffect(() => {
     if (path === '/dashboard') {
@@ -53,7 +79,7 @@ function App() {
     window.localStorage.setItem('chakra-theme', theme)
   }, [theme])
 
-  const fetchWallet = async (isQuick = false, page = 1) => {
+  const fetchWallet = async (isQuick = false, page = 1, refresh = false, overrides = {}) => {
     if (!address || !address.trim()) {
       setError('Please enter a valid wallet address')
       return
@@ -61,14 +87,22 @@ function App() {
 
     setLoading(true)
     setError(null)
-    const effectiveHops = isQuick ? 0 : hops
+    const effectiveHops = isQuick ? 0 : (overrides.hops ?? hops)
+    const effectiveLimit = overrides.limit ?? limit
 
     try {
-      const result = await api.fetchWalletDashboard(address.trim(), effectiveHops, limit, page)
+      const result = await api.fetchWalletDashboard(
+        address.trim(),
+        effectiveHops,
+        effectiveLimit,
+        page,
+        refresh
+      )
       // Debug: inspect full API payload including graph.nodes / graph.edges
       // to verify the backend is returning the expected structure.
       console.log('[App] API RESPONSE:', result)
       setData(result)
+      setAnalysisMode(isQuick ? 'quick' : 'deep')
     } catch (e) {
       console.error('Fetch error:', e)
       if (e instanceof ApiError) {
@@ -77,6 +111,7 @@ function App() {
         setError('Failed to fetch wallet data. Please try again.')
       }
       setData(null)
+      setAnalysisMode(null)
     } finally {
       setLoading(false)
     }
@@ -94,14 +129,22 @@ function App() {
           address={address}
           setAddress={setAddress}
           hops={hops}
-          setHops={setHops}
           limit={limit}
-          setLimit={setLimit}
           data={data}
+          analysisMode={analysisMode}
           loading={loading}
           error={error}
           onScan={(isQuick) => fetchWallet(isQuick, 1)}
+          onRefresh={() => fetchWallet(analysisMode !== 'deep', 1, true)}
           onPageChange={(page) => fetchWallet(false, page)}
+          onHopsChange={(nextHops) => {
+            setHops(nextHops)
+            if (analysisMode === 'deep') fetchWallet(false, 1, false, { hops: nextHops })
+          }}
+          onLimitChange={(nextLimit) => {
+            setLimit(nextLimit)
+            if (analysisMode === 'deep') fetchWallet(false, 1, false, { limit: nextLimit })
+          }}
           onGraph={() => navigate('/graph')}
           onClearError={() => setError(null)}
         />
@@ -136,11 +179,7 @@ function App() {
           activeView={dashboardSection}
           setActiveView={(id) => {
             setDashboardSection(id)
-            if (id === 'dashboard' || id === 'wallet-analysis' || id === 'transaction-explorer' || id === 'risk-monitor' || id === 'settings') {
-              navigate('/dashboard')
-            } else {
-              navigate('/dashboard')
-            }
+            navigate('/dashboard')
           }}
           collapsed={sidebarCollapsed}
           setCollapsed={setSidebarCollapsed}

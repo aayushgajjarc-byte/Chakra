@@ -1,31 +1,57 @@
 import { motion } from 'framer-motion'
-import { useRef } from 'react'
-import { Search, Activity, ShieldCheck, RefreshCw, Layers } from 'lucide-react'
+import { useRef, useEffect } from 'react'
+import { Search, Activity, ShieldCheck, Layers, RefreshCw, Network } from 'lucide-react'
 import SummaryCards from './SummaryCards'
 import TransactionsTable from './TransactionsTable'
 import RiskAnalyticsPanel from './RiskAnalyticsPanel'
 
 export default function Dashboard({
+  activeSection = 'dashboard',
   address,
   setAddress,
   hops,
-  setHops,
   limit,
-  setLimit,
   data,
+  analysisMode,
   loading,
   error,
   onScan,
+  onRefresh,
   onPageChange,
+  onGraph,
+  onHopsChange,
+  onLimitChange,
 }) {
   const overviewRef = useRef(null)
+  const walletSearchRef = useRef(null)
+  const dossierHeaderRef = useRef(null)
   const transactionsRef = useRef(null)
   const riskRef = useRef(null)
 
-  // Determine what to show based on the analysis type (hops)
+  useEffect(() => {
+    if (activeSection === 'wallet-analysis') {
+      const dossierEl = dossierHeaderRef.current
+      const searchEl = walletSearchRef.current
+      const walletTarget =
+        data && !loading && dossierEl && (analysisMode === 'quick' || analysisMode === 'deep')
+          ? dossierEl
+          : searchEl
+      walletTarget?.scrollIntoView({ behavior: 'smooth', block: 'start' })
+      return
+    }
+    const sections = {
+      dashboard: overviewRef,
+      'transaction-explorer': transactionsRef,
+      'risk-monitor': riskRef,
+    }
+    const ref = sections[activeSection]
+    ref?.current?.scrollIntoView({ behavior: 'smooth', block: 'start' })
+  }, [activeSection, data, loading, analysisMode])
+
+  // Determine what to show based on explicit UI flow mode.
   const isInitial = !data && !loading
-  const isQuick = data && data.hops === 0
-  const isDeep = data && data.hops > 0
+  const isQuick = Boolean(data) && analysisMode !== 'deep'
+  const isDeep = Boolean(data) && analysisMode === 'deep'
 
   const SearchBar = ({ isHero = false }) => (
     <div className={`w-full ${isHero ? 'max-w-2xl' : 'max-w-4xl mb-8'} bg-card border border-border p-6 rounded-3xl shadow-2xl space-y-6 backdrop-blur-xl mx-auto transition-all duration-500`}>
@@ -39,25 +65,16 @@ export default function Dashboard({
           disabled={loading}
           className="w-full bg-surface border-2 border-border rounded-2xl pl-16 pr-6 py-4 text-xl text-textPrimary placeholder-muted focus:outline-none focus:border-primary focus:ring-0 transition-all disabled:opacity-50"
           placeholder="Enter Wallet Address (0x...)"
-          onKeyPress={(e) => e.key === 'Enter' && onScan(true)}
         />
       </div>
-      <div className="flex gap-4">
+      <div className="flex">
         <button
           onClick={() => onScan(true)}
           disabled={loading}
-          className="flex-1 bg-primary/10 border border-primary/30 text-primary py-4 rounded-xl font-bold text-lg hover:bg-primary/20 transition-all active:scale-95 flex items-center justify-center gap-2 disabled:opacity-50"
+          className="w-full bg-primary text-background py-4 rounded-xl font-bold text-lg shadow-glow hover:opacity-90 transition-all active:scale-95 flex items-center justify-center gap-2 disabled:opacity-50"
         >
           <Activity size={20} />
-          Quick Analysis
-        </button>
-        <button
-          onClick={() => onScan(false)}
-          disabled={loading}
-          className="flex-1 bg-primary text-background py-5 rounded-xl font-bold text-lg shadow-glow hover:opacity-90 transition-all active:scale-95 flex items-center justify-center gap-2 disabled:opacity-50"
-        >
-          <ShieldCheck size={20} />
-          Deep Dive
+          Analyze
         </button>
       </div>
     </div>
@@ -82,7 +99,12 @@ export default function Dashboard({
             </p>
           </motion.div>
         )}
-        <SearchBar isHero={isInitial} />
+        <div
+          ref={walletSearchRef}
+          className={isInitial ? '' : 'scroll-mt-24'}
+        >
+          <SearchBar isHero={isInitial} />
+        </div>
       </div>
 
       {/* 2. Loading State */}
@@ -114,8 +136,11 @@ export default function Dashboard({
           animate={{ opacity: 1, y: 0 }}
           className="space-y-10 mt-4"
         >
-          {/* Results Status Header with Controls */}
-          <div className="flex flex-col md:flex-row md:items-center justify-between gap-6 bg-card/50 p-6 border border-border rounded-2xl backdrop-blur-sm">
+          {/* Results Status Header + controls — Wallet Analysis */}
+          <div
+            ref={dossierHeaderRef}
+            className="flex flex-col md:flex-row md:items-center justify-between gap-6 bg-card/50 p-6 border border-border rounded-2xl backdrop-blur-sm scroll-mt-24"
+          >
             <div className="flex items-center gap-4">
                <div className={`w-3 h-3 rounded-full ${isQuick ? 'bg-warning shadow-[0_0_15px_rgba(255,171,0,0.5)]' : 'bg-success shadow-[0_0_15px_rgba(0,240,255,0.5)]'}`}></div>
                <div>
@@ -125,51 +150,73 @@ export default function Dashboard({
                   <p className="text-[10px] text-muted mt-2 font-mono uppercase tracking-widest opacity-60">
                     Target: {address}
                   </p>
+                  {data?.queried_at && (
+                    <p className="text-[10px] text-muted mt-1 font-mono uppercase tracking-widest opacity-60">
+                      Queried At: {new Date(data.queried_at).toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' })} IST
+                    </p>
+                  )}
                </div>
             </div>
-            
-            {/* Contextual Controls */}
-            <div className="flex items-center gap-4">
-              {isDeep && (
-                <div className="flex items-center gap-4 border-l border-border pl-4">
-                  <div className="flex items-center gap-2">
-                    <span className="text-[10px] font-mono text-muted uppercase">Hops:</span>
-                    <select
-                      value={hops}
-                      onChange={(e) => setHops(Number(e.target.value))}
-                      className="bg-surface border border-border rounded-lg px-2 py-1 text-xs text-textPrimary focus:outline-none"
-                    >
-                      <option value={1}>1 Hop</option>
-                      <option value={2}>2 Hops</option>
-                    </select>
-                  </div>
-                  <div className="flex items-center gap-2">
-                    <span className="text-[10px] font-mono text-muted uppercase">Size:</span>
-                    <select
-                      value={limit}
-                      onChange={(e) => setLimit(Number(e.target.value))}
-                      className="bg-surface border border-border rounded-lg px-2 py-1 text-xs text-textPrimary focus:outline-none"
-                    >
-                      <option value={10}>10 per page</option>
-                      <option value={50}>50 per page</option>
-                      <option value={100}>100 per page</option>
-                    </select>
-                  </div>
+
+            {isDeep && (
+              <div className="flex items-center gap-4 border-l border-border pl-4">
+                <div className="flex items-center gap-2">
+                  <span className="text-[10px] font-mono text-muted uppercase">Hops:</span>
+                  <select
+                    value={hops}
+                    onChange={(e) => onHopsChange?.(Number(e.target.value))}
+                    disabled={loading}
+                    className="bg-surface border border-border rounded-lg px-2 py-1 text-xs text-textPrimary focus:outline-none disabled:opacity-50"
+                  >
+                    <option value={1}>1 Hop</option>
+                    <option value={2}>2 Hops</option>
+                    <option value={3}>3 Hops</option>
+                  </select>
                 </div>
+                <div className="flex items-center gap-2">
+                  <span className="text-[10px] font-mono text-muted uppercase">Size:</span>
+                  <select
+                    value={limit}
+                    onChange={(e) => onLimitChange?.(Number(e.target.value))}
+                    disabled={loading}
+                    className="bg-surface border border-border rounded-lg px-2 py-1 text-xs text-textPrimary focus:outline-none disabled:opacity-50"
+                  >
+                    <option value={10}>10 per page</option>
+                    <option value={50}>50 per page</option>
+                    <option value={100}>100 per page</option>
+                  </select>
+                </div>
+              </div>
+            )}
+            <div className="flex items-center gap-2 ml-auto md:ml-0">
+              {onGraph && isDeep && (
+                <button
+                  type="button"
+                  onClick={onGraph}
+                  disabled={loading || !data}
+                  className="flex items-center gap-2 px-3 py-2 rounded-lg bg-surface border border-border text-textPrimary text-xs font-mono uppercase tracking-wide hover:border-primary hover:text-primary transition-all disabled:opacity-50 disabled:cursor-not-allowed"
+                  title="Open wallet connection graph"
+                >
+                  <Network size={16} className="text-primary" />
+                  Graph
+                </button>
               )}
-              <button
-                onClick={() => onScan(isQuick)}
-                className="bg-primary/10 text-primary p-2 rounded-lg hover:bg-primary/20 transition-all"
-                title="Refresh current view"
-              >
-                <RefreshCw size={16} />
-              </button>
+              {onRefresh && (
+                <button
+                  type="button"
+                  onClick={onRefresh}
+                  className="bg-primary/10 text-primary p-2 rounded-lg hover:bg-primary/20 transition-all"
+                  title="Refresh from Etherscan"
+                >
+                  <RefreshCw size={16} />
+                </button>
+              )}
             </div>
           </div>
 
-          {/* Cards Section */}
-          <div ref={overviewRef}>
-            <SummaryCards data={data} loading={loading} error={error} />
+          {/* Summary cards — Dashboard */}
+          <div ref={overviewRef} className="scroll-mt-24">
+            <SummaryCards data={data} loading={loading} error={error} quickMode={isQuick} />
           </div>
 
           {/* Forensic Sections (Only for Deep Dive) */}
@@ -180,7 +227,7 @@ export default function Dashboard({
               transition={{ delay: 0.1 }}
               className="space-y-10"
             >
-              <div ref={transactionsRef} className="bg-card backdrop-blur-xl border border-border rounded-3xl overflow-hidden shadow-2xl">
+              <div ref={transactionsRef} className="bg-card backdrop-blur-xl border border-border rounded-3xl overflow-hidden shadow-2xl scroll-mt-24">
                 <div className="p-8 border-b border-border flex justify-between items-center">
                   <div className="flex items-center gap-3">
                     <Layers className="text-primary" size={24} />
@@ -200,13 +247,28 @@ export default function Dashboard({
                   onPageChange={onPageChange}
                   currentPage={data?.page || 1}
                   pageSize={limit}
+                  deepDiveInProgress={Boolean(data?.deep_dive_in_progress)}
+                  deepDiveReady={Boolean(data?.deep_dive_ready)}
                 />
               </div>
 
-              <div ref={riskRef}>
+              <div ref={riskRef} className="scroll-mt-24">
                 <RiskAnalyticsPanel data={data} loading={loading} />
               </div>
             </motion.div>
+          )}
+
+          {isQuick && (
+            <div className="flex justify-center pt-2">
+              <button
+                onClick={() => onScan(false)}
+                disabled={loading}
+                className="bg-primary text-background px-8 py-3 rounded-xl font-bold text-sm shadow-glow hover:opacity-90 transition-all active:scale-95 flex items-center justify-center gap-2 disabled:opacity-50 uppercase tracking-wide"
+              >
+                <ShieldCheck size={16} />
+                Deep Dive
+              </button>
+            </div>
           )}
         </motion.div>
       )}

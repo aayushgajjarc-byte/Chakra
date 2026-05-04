@@ -2,9 +2,9 @@ import { motion } from 'framer-motion'
 import { Wallet, Activity, Users, AlertTriangle, ArrowUpRight, ArrowDownLeft } from 'lucide-react'
 import { CardSkeleton } from './ui/Skeleton'
 
-export default function SummaryCards({ data, loading, error }) {
-  // Determine if we should show the full set or just the quick set
-  const isQuick = data && data.hops === 0
+export default function SummaryCards({ data, loading, error, quickMode = false }) {
+  // Determine if we should show the full set or just the quick set.
+  const isQuick = Boolean(data) && quickMode
 
   const cards = [
     {
@@ -16,13 +16,18 @@ export default function SummaryCards({ data, loading, error }) {
       showInQuick: true,
     },
     {
-      title: 'Total Transactions',
+      title: 'Normal transactions',
       value: data?.transaction_count ?? data?.transactions?.length ?? 0,
       icon: Activity,
       color: 'text-primary',
       testId: 'total-transactions-card',
       showInQuick: true,
-      breakdown: data ? { in: data.incoming_count, out: data.outgoing_count } : null
+      breakdown:
+        data &&
+        typeof data.incoming_count === 'number' &&
+        typeof data.outgoing_count === 'number'
+          ? { in: data.incoming_count, out: data.outgoing_count }
+          : null,
     },
     {
       title: 'Connected Wallets',
@@ -34,9 +39,9 @@ export default function SummaryCards({ data, loading, error }) {
     },
     {
       title: 'Risk Score',
-      value: data ? `${data.risk_score || 0}%` : null,
+      value: data ? (data.risk_score > 70 ? 'HIGH' : data.risk_score > 40 ? 'MEDIUM' : 'LOW') : null,
       icon: AlertTriangle,
-      color: 'text-danger',
+      color: data && data.risk_score > 70 ? 'text-danger' : data && data.risk_score > 40 ? 'text-warning' : 'text-success',
       testId: 'risk-score-card',
       showInQuick: false,
     },

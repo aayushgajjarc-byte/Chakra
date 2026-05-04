@@ -156,10 +156,16 @@ export const api = {
    * POST /api/wallet/analyze — primary dashboard endpoint.
    * Token is automatically injected. 401 → redirect to login.
    */
-  async fetchWalletDashboard(address, hops = 1, limit = 10, page = 1) {
+  async fetchWalletDashboard(address, hops = 1, limit = 10, page = 1, refresh = false) {
     return _request('/api/wallet/analyze', {
       method: 'POST',
-      body: JSON.stringify({ address, hops, limit, page }),
+      body: JSON.stringify({
+        address,
+        hops,
+        limit,
+        page,
+        refresh,
+      }),
     })
   },
 
@@ -179,6 +185,24 @@ export const api = {
     return _request('/api/wallet/analyze', {
       method: 'POST',
       body: JSON.stringify({ address, hops, limit }),
+    })
+  },
+
+  /**
+   * GET /api/wallet/history — fetch query history from MongoDB.
+   */
+  async fetchHistory() {
+    return _request('/api/wallet/history')
+  },
+
+  /**
+   * POST /api/wallet/cache/clear — clear Mongo cached transactions/queries.
+   * If address is omitted, clears all cached wallet data.
+   */
+  async clearWalletCache(address = null) {
+    return _request('/api/wallet/cache/clear', {
+      method: 'POST',
+      body: JSON.stringify({ address }),
     })
   },
 }
