@@ -3,6 +3,7 @@ import react from '@vitejs/plugin-react'
 
 export default defineConfig({
   plugins: [react()],
+  preview: {allowedHosts: ['chakra-frontend.onrender.com']},
   build: {
     chunkSizeWarningLimit: 1500,
   },
